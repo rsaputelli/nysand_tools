@@ -16,6 +16,28 @@ The app will:
 - Provide a file for unmatched/out-of-state members
 - Let you download everything in a single ZIP
 """)
+# === Branding header ===
+header_left, header_right = st.columns([3, 8])   # wider left column
+
+def _find_logo():
+    for p in ("assets/logo.png", "logo.png"):
+        if os.path.exists(p):
+            return p
+    return None
+
+with header_left:
+    _logo = _find_logo()
+    if _logo:
+        st.image(_logo, width=220)
+    else:
+        st.caption("(logo not found: assets/logo.png or logo.png)")
+with header_right:
+    st.markdown("## Multi-Client Prospect Tracker")
+	
+# Optional: sidebar logo
+if _find_logo():
+    st.sidebar.image(_find_logo(), use_container_width=True)
+
 
 member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
 region_file = st.file_uploader("📄 Upload NYSAND Region Zipcodes Excel", type=["xls", "xlsx"])
@@ -69,3 +91,4 @@ if member_file and region_file:
             with open(zip_path, "rb") as f:
                 st.success("✅ Done! Download your ZIP file below.")
                 st.download_button("📥 Download All Files (ZIP)", f.read(), file_name="NYSAND_Member_Files.zip")
+
