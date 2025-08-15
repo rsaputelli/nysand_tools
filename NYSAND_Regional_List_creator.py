@@ -5,17 +5,6 @@ import tempfile
 import re
 import os
 
-st.set_page_config(page_title="NYSAND Region Splitter", layout="centered")
-st.title("📍 NYSAND Region-Based Member Splitter")
-st.markdown("""
-Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**.
-The app will:
-- Clean and match ZIP codes
-- Add Region and County
-- Split the data by Region
-- Provide a file for unmatched/out-of-state members
-- Let you download everything in a single ZIP
-""")
 # === Branding header ===
 header_left, header_right = st.columns([3, 8])   # wider left column
 
@@ -32,13 +21,17 @@ with header_left:
     else:
         st.caption("(logo not found: assets/logo.png or logo.png)")
 with header_right:
-    st.markdown("## Multi-Client Prospect Tracker")
+    st.markdown("## NYSAND Region-Based Member Splitter")
 	
-# Optional: sidebar logo
-if _find_logo():
-    st.sidebar.image(_find_logo(), use_container_width=True)
-
-
+st.markdown("""
+Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**.
+The app will:
+- Clean and match ZIP codes
+- Add Region and County
+- Split the data by Region
+- Provide a file for unmatched/out-of-state members
+- Let you download everything in a single ZIP
+""")
 member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
 region_file = st.file_uploader("📄 Upload NYSAND Region Zipcodes Excel", type=["xls", "xlsx"])
 
@@ -91,4 +84,5 @@ if member_file and region_file:
             with open(zip_path, "rb") as f:
                 st.success("✅ Done! Download your ZIP file below.")
                 st.download_button("📥 Download All Files (ZIP)", f.read(), file_name="NYSAND_Member_Files.zip")
+
 
