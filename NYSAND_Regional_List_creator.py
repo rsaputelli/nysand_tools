@@ -15,470 +15,370 @@ import xmltodict
 # =========================
 DEFAULT_REGION_PATH = "assets/nysand_region_zips.xlsx"
 
-def load_region_mapping(region_xlsx_file=None):
-    """Return a dict of DataFrames keyed by sheet name, or None if not found."""
-    if region_xlsx_file is not None:
-        return pd.read_excel(region_xlsx_file, sheet_name=None)
-    if os.path.exists(DEFAULT_REGION_PATH):
-        return pd.read_excel(DEFAULT_REGION_PATH, sheet_name=None)
-    return None
+def load_region_mapping(uploaded_file):
+    """
+    Load the region zip mapping workbook. Try the user upload first (if provided),
+    else fall back to the bundled DEFAULT_REGION_PATH. Return a dict of sheet->DataFrame
+    with normalized columns: Zip (str), County (str), Region (str).
+    """
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Try to find zip-ish column
+        cols_lower = {c.lower(): c for c in df.columns}
+        zip_col = None
+        for cand in ["zip", "zipcode", "zip_code", "postal", "postalcode"]:
+            if cand in cols_lower:
+                zip_col = cols_lower[cand]
+                break
+        if zip_col is None:
+            # If first column looks numeric/zip-like, use it
+            zip_col = df.columns[0]
 
+        # Standardized output
+        out = pd.DataFrame()
+        out["Zip"] = df[zip_col].astype(str).str.replace(r"\D+", "", regex=True).str.zfill(5)
+
+        # County/Region best-effort
+        county_col = None
+        region_col = None
+        for cand in ["county", "region"]:
+            if cand in cols_lower:
+                if cand == "county":
+                    county_col = cols_lower[cand]
+                else:
+                    region_col = cols_lower[cand]
+
+        out["County"] = df[county_col].astype(str).str.strip() if county_col else ""
+        out["Region"] = df[region_col].astype(str).str.strip() if region_col else ""
+
+        # Remove empties
+        out = out[out["Zip"].str.len() == 5]
+        out = out.drop_duplicates(subset=["Zip"]).reset_index(drop=True)
+        return out
+
+    try:
+        if uploaded_file is not None:
+            xls = pd.ExcelFile(uploaded_file)
+        else:
+            # bundled file next to app (allow working dir or current path)
+            path_try = DEFAULT_REGION_PATH
+            if not os.path.exists(path_try):
+                # try app-relative path
+                here = os.path.dirname(__file__)
+                path_try = os.path.join(here, DEFAULT_REGION_PATH)
+            xls = pd.ExcelFile(path_try)
+    except Exception:
+        return None
+
+    sheets = {}
+    for name in xls.sheet_names:
+        df = xls.parse(name)
+        sheets[name] = _normalize_df(df)
+    return sheets
 
 # =========================
-# Branding header
+# Assets / logo helper
 # =========================
-header_left, header_right = st.columns([3, 8])
-
 def _find_logo():
-    for p in ("assets/logo.png", "logo.png"):
+    candidates = [
+        "assets/nysand_logo.png",
+        "assets/logo.png",
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
-    return None
-
-with header_left:
-    _logo = _find_logo()
-    if _logo:
-        st.image(_logo, width=220)
-    else:
-        st.caption("(logo not found: assets/logo.png or logo.png)")
-with header_right:
-    st.markdown("## NYSAND Region-Based Member Splitter")
-
-st.markdown("""
-Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**, **or** fetch the member list via the EatRight SOAP API, then:
-- Clean and match ZIP codes  
-- Add Region and County  
-- Split the data by Region  
-- Provide an unmatched/out-of-state file  
-- Download everything in a single ZIP
-""")
-
-
-# =========================
-# SOAP API helpers
-# =========================
-SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-API_NS  = "http://eatright/membership"
-
-# Per ADA docs / observed cert problem — use HTTP only
-ENDPOINT = "http://ws.eatright.org/service/service.svc"
-WSDL_URL = "http://ws.eatright.org/service/service.svc?wsdl"
-
-def _wsdl_actions_map() -> dict:
-    """Return {operationName: [soapAction, ...]} by parsing the WSDL (best-effort)."""
-    try:
-        r = requests.get(WSDL_URL, timeout=60)
-        r.raise_for_status()
-        doc = xmltodict.parse(r.text)
-    except Exception:
-        return {}
-
-    actions = {}
-    defs = doc.get("wsdl:definitions") or doc.get("definitions") or {}
-    bindings = defs.get("wsdl:binding") or defs.get("binding") or []
-    if isinstance(bindings, dict):
-        bindings = [bindings]
-    for b in bindings:
-        ops = b.get("wsdl:operation") or b.get("operation") or []
-        if isinstance(ops, dict):
-            ops = [ops]
-        for op in ops:
-            name = op.get("@name")
-            if not name:
-                continue
-            # SOAP 1.1
-            soap_op = op.get("soap:operation")
-            if isinstance(soap_op, dict) and "@soapAction" in soap_op:
-                actions.setdefault(name, []).append(soap_op["@soapAction"])
-            # SOAP 1.2 (we won't post 1.2, but collect actions just in case)
-            soap12_op = op.get("soap12:operation")
-            if isinstance(soap12_op, dict) and "@soapAction" in soap12_op:
-                actions.setdefault(name, []).append(soap12_op["@soapAction"])
-    return actions
-
-_WSDL_ACTIONS = _wsdl_actions_map()
-
-def _wsdl_action_for(method: str) -> list[str]:
-    return _WSDL_ACTIONS.get(method, [])
-
-
-# =========================
-# Shared processing helpers
-# =========================
-def _clean_zip(z):
-    """Extract first 5 digits, return as 5-char string (drops +4 and non-digits)."""
-    if z is None or (isinstance(z, float) and pd.isna(z)):
-        return None
-    s = str(z).strip()
-    if not s:
-        return None
-    m = re.search(r"\b(\d{5})\b", s)
-    return m.group(1) if m else None
-
-# Accept any plausible ZIP field name that could come from API or CSV/XLSX
-ZIP_CANDIDATE_COLS = [
-    "Zip", "ZIP", "zip",
-    "PostalCode", "Postal Code", "postal_code", "postal", "postal code",
-    "ZipCode", "Zip Code", "zipcode", "ZIPCODE",
-]
-
-def _ensure_member_zip_column(members_df: pd.DataFrame) -> str | None:
-    """
-    Ensure members_df has a 'Zip_clean' column, derived from any plausible ZIP field.
-    Returns the source column name if found, else None.
-    """
-    for c in ZIP_CANDIDATE_COLS:
-        if c in members_df.columns:
-            z = members_df[c].map(_clean_zip)
-            if z.notna().any():
-                members_df["Zip_clean"] = z.astype(str).str.zfill(5)
-                return c
-    members_df["Zip_clean"] = None  # still create column so downstream code runs
-    return None
-
-
-def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
-    header = (
-        f"""
-        <s:Header>
-          <AccessKey xmlns="{API_NS}" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
-            <Value>{access_key}</Value>
-          </AccessKey>
-        </s:Header>
-        """
-        if access_key else "<s:Header/>"
-    )
-    return f"""<s:Envelope xmlns:s="{SOAP_NS}">
-{header}
-  <s:Body>
-{body_xml}
-  </s:Body>
-</s:Envelope>""".strip()
-
-
-def _post_soap(action: str, envelope_xml: str) -> dict:
-    """
-    SOAP 1.1 over HTTP only.
-    Tries WSDL-declared soapAction(s) then common WCF variants, then empty SOAPAction.
-    On HTTP error, attempts to surface the SOAP Fault faultstring.
-    Always writes the last response body to /tmp/soap_response.xml for debugging.
-    """
-    base = API_NS  # "http://eatright/membership"
-    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # from WSDL, if any
-    candidates += [
-        f"{base}/{action}",
-        f"{base}/IService/{action}",
-        f"{base}/IWcfAdaMembership/{action}",
-        "",  # some WCF endpoints allow empty SOAPAction
-    ]
-
-    last_body = ""
-    errors = []
-    for sa in candidates:
-        headers = {
-            "Content-Type": "text/xml; charset=utf-8",
-            "Accept": "text/xml",
-            "SOAPAction": f"\"{sa}\"" if sa is not None else ""
-        }
         try:
-            r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
-            last_body = r.text or ""
-            # save raw for inspection
-            try:
-                with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
-                    f.write(last_body)
-            except Exception:
-                pass
-
-            if r.status_code >= 400:
-                # Try to parse a SOAP Fault
-                try:
-                    doc = xmltodict.parse(last_body)
-                    fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
-                             or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
-                    if fault:
-                        fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
-                        errors.append(f'SOAPAction={headers.get("SOAPAction","")} → Fault: {fs}')
-                        continue
-                except Exception:
-                    pass
-                errors.append(f'SOAPAction={headers.get("SOAPAction","")} → HTTP {r.status_code}')
-                continue
-
-            return xmltodict.parse(last_body)
-
-        except Exception as e:
-            errors.append(f'SOAPAction={headers.get("SOAPAction","")} → {e}')
-
-    if last_body:
-        # preserve the last response for download/inspection
-        try:
-            with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
-                f.write(last_body)
+            here = os.path.dirname(__file__)
+            maybe = os.path.join(here, p)
+            if os.path.exists(maybe):
+                return maybe
         except Exception:
             pass
-    raise RuntimeError(" ; ".join(errors) or "All SOAP 1.1 attempts failed.")
+    return None
 
+# =========================
+# SOAP helpers
+# =========================
+def _wsdl_actions_map():
+    # Minimal map for reference; you can extend as needed
+    return {
+        "ValidateAccessKey": "http://eatright.org/ValidateAccessKey",
+        "GetMembers": "http://eatright.org/GetMembers",
+    }
 
+def _wsdl_action_for(op):
+    return _wsdl_actions_map().get(op, "")
 
-def _validate_access_key(access_key: str) -> bool:
-    body = f"""
-    <ValidateAccessKey xmlns="{API_NS}">
-      <key>{access_key}</key>
-    </ValidateAccessKey>
-    """.strip()
-    # IMPORTANT: per docs, do NOT send the AccessKey header for ValidateAccessKey
-    env = _soap_envelope(body, access_key=None)
-    data = _post_soap("ValidateAccessKey", env)
+def _clean_zip(s):
+    return re.sub(r"\D+", "", str(s or ""))[:5]
+
+def _ensure_member_zip_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure there's a member ZIP column named Zip_clean for matching.
+    Tries a variety of common column names (Zip, ZIP Code, Postal, etc.).
+    """
+    zcols = [c for c in df.columns if c.lower() in ("zip", "zipcode", "zip code", "postal", "postalcode", "home zip", "primary zip")]
+    if not zcols:
+        # keep as-is; downstream will show 0 matches
+        df["Zip_clean"] = ""
+        return df
+    # pick best
+    z = zcols[0]
+    df["Zip_clean"] = df[z].map(_clean_zip).fillna("")
+    return df
+
+def _soap_envelope(access_key: str, group_key: str, include_custom: bool = True):
+    # Basic SOAP envelope; customize as needed if API requires paging/filters
+    custom_tag = f"<IncludeCustomProperties>{'true' if include_custom else 'false'}</IncludeCustomProperties>"
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <GetMembers xmlns="http://eatright.org/">
+      <AccessKey>{access_key}</AccessKey>
+      <GroupKey>{group_key}</GroupKey>
+      {custom_tag}
+    </GetMembers>
+  </soap:Body>
+</soap:Envelope>
+"""
+
+def _post_soap(endpoint_url: str, soap_action: str, body_xml: str) -> str:
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "SOAPAction": soap_action,
+    }
+    resp = requests.post(endpoint_url, data=body_xml.encode("utf-8"), headers=headers, timeout=60)
+    resp.raise_for_status()
+    # Save last response for debug
     try:
-        result = data["s:Envelope"]["s:Body"]["ValidateAccessKeyResponse"]["ValidateAccessKeyResult"]
-        return str(result.get("a:Success", result.get("Success", "false"))).lower() == "true"
+        with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+            f.write(resp.text)
+    except Exception:
+        pass
+    return resp.text
+
+def _validate_access_key(endpoint_url: str, access_key: str) -> bool:
+    # Optionally call ValidateAccessKey if required by service
+    try:
+        envelope = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <ValidateAccessKey xmlns="http://eatright.org/">
+      <AccessKey>{access_key}</AccessKey>
+    </ValidateAccessKey>
+  </soap:Body>
+</soap:Envelope>
+"""
+        xml = _post_soap(endpoint_url, _wsdl_action_for("ValidateAccessKey"), envelope)
+        d = xmltodict.parse(xml)
+        # Interpret success; if service returns boolean/status, adapt here
+        return True if d else False
     except Exception:
         return False
 
-
-def _find_members_anywhere(obj):
+def _find_members_anywhere(d: dict):
     """
-    Recursively search a parsed xmltodict structure for a list/dict of members.
-    We look for arrays whose items look like person records (have RecordNumber/LoginName/PostalCode/etc.).
-    Returns a list[dict] (possibly empty).
+    Walk a parsed SOAP dict to find the members array, tolerating nesting.
+    Returns a list[dict] of member objects (best-effort).
     """
-    CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}
     out = []
 
-    def is_member_dict(d):
-        if not isinstance(d, dict):
+    def is_member_dict(candidate):
+        # Heuristic: member-ish dict has name/zip/email fields (very loose)
+        if not isinstance(candidate, dict):
             return False
-        # strip namespace prefixes for key comparison
-        keys = {k.split(":", 1)[-1] for k in d.keys()}
-        return len(CANDIDATE_KEYS.intersection(keys)) >= 2  # at least two familiar fields
+        keys = {k.lower() for k in candidate.keys()}
+        signals = ["name", "firstname", "lastname", "zip", "zipcode", "email"]
+        return any(s in keys for s in signals)
 
-    def walk(x):
-        nonlocal out
-        if isinstance(x, list):
-            # if this list already looks like members, keep items that are dict-like
-            if x and all(isinstance(i, dict) for i in x) and any(is_member_dict(i) for i in x):
-                out.extend([i for i in x if isinstance(i, dict)])
-                return
-            for i in x:
-                walk(i)
-        elif isinstance(x, dict):
-            # if this dict itself looks like a member, capture it
-            if is_member_dict(x):
-                out.append(x)
-                return
-            for v in x.values():
+    def walk(node):
+        if isinstance(node, dict):
+            # If looks like a member, capture it
+            if is_member_dict(node):
+                out.append(node)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
                 walk(v)
 
-    walk(obj)
+    walk(d)
     return out
 
+def is_member_dict(candidate):
+    return isinstance(candidate, dict)
 
-def fetch_members_via_api(access_key: str, group_key: str, *, include_custom_props: bool = True) -> pd.DataFrame:
+def fetch_members_via_api(access_key: str, group_key: str, include_custom_props: bool = True) -> pd.DataFrame:
     """
-    Calls RetrieveGroupMembersWithCustomProperties (default) or RetrieveGroupMembers,
-    parses members robustly, expands CustomProperties when present, and normalizes Zip column.
+    Call the EatRight SOAP API, parse xml to dict, find a members array, and
+    return a DataFrame. Also add Zip_clean for downstream matching.
     """
-    method = "RetrieveGroupMembersWithCustomProperties" if include_custom_props else "RetrieveGroupMembers"
-    body = f"""
-    <{method} xmlns="{API_NS}">
-      <groupKey>{group_key}</groupKey>
-    </{method}>
-    """.strip()
-    env = _soap_envelope(body, access_key=access_key)
+    endpoint = st.secrets.get("EATR_ENDPOINT_URL", "https://reports.eatright.org/MemberServices/MemberService.asmx")
+    # Optionally validate key (no-op if service doesn't require)
+    _ = _validate_access_key(endpoint, access_key)
 
-    data = _post_soap(method, env)  # <- resilient SOAPAction handling, saves /tmp/soap_response.xml
+    envelope = _soap_envelope(access_key, group_key, include_custom_props)
+    xml = _post_soap(endpoint, _wsdl_action_for("GetMembers"), envelope)
 
-    # Navigate to the result node
-    body_node = (data.get("s:Envelope") or data.get("Envelope") or {}).get("s:Body") or data.get("Body") or {}
-    resp_key = f"{method}Response"
-    res_key  = f"{method}Result"
-    node = body_node.get(resp_key) or body_node.get(res_key) or body_node
-    if isinstance(node, dict) and res_key in node:
-        node = node[res_key]
+    try:
+        parsed = xmltodict.parse(xml)
+    except Exception as e:
+        raise RuntimeError(f"SOAP XML parse error: {e}") from e
 
-    # Robust member discovery
-    rows = _find_members_anywhere(node)
+    members = _find_members_anywhere(parsed)
+    if not members:
+        # Try to find any table-ish structure
+        # If service returns a single dict, wrap it
+        if isinstance(parsed, dict):
+            members = [parsed]
+    # Normalize to DataFrame
+    df = pd.json_normalize(members, max_level=3)
+    df = df.drop_duplicates().reset_index(drop=True)
 
-    # Fallback to explicit Members/Member nesting
-    if not rows and isinstance(node, dict):
-        container = node
-        for k in ("a:Members", "Members"):
-            if k in container:
-                container = container[k]
-        members = None
-        if isinstance(container, dict):
-            members = container.get("a:Member") or container.get("Member")
-        rows = [members] if isinstance(members, dict) else (members or [])
-
-    if not rows:
-        return pd.DataFrame()
-
-    def strip_ns(d):
-        return {k.split(":", 1)[-1]: v for k, v in d.items()} if isinstance(d, dict) else {}
-
-    cleaned = [strip_ns(r) for r in rows]
-
-    # Expand CustomProperties if available
-    df = pd.DataFrame(cleaned)
-    if "CustomProperties" in df.columns:
-        def props_to_dict(v):
-            if not isinstance(v, dict):
-                return {}
-            items = v.get("a:CustomProperty") or v.get("CustomProperty") or []
-            if isinstance(items, dict):
-                items = [items]
-            out = {}
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                name = it.get("a:Name") or it.get("Name")
-                val  = it.get("a:Value") or it.get("Value")
-                if name:
-                    out[str(name)] = val
-            return out
-        props = df["CustomProperties"].apply(props_to_dict).apply(pd.Series)
-        df = pd.concat([df.drop(columns=["CustomProperties"]), props], axis=1)
-
-    # Normalize a Zip column for the rest of the pipeline
-    candidates = [c for c in df.columns if c.lower() in ("zip", "zipcode", "postalcode", "postal_code")]
-    df["Zip"] = df[candidates[0]] if candidates else None
+    # Ensure zip-clean column for matching
+    df = _ensure_member_zip_column(df)
     return df
 
+def strip_ns(colname: str) -> str:
+    # Strip XML namespaces from column names for nicer display
+    return re.sub(r"(^.*:)", "", colname or "")
 
+def props_to_dict(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If any columns are nested custom properties dicts, flatten them.
+    Best-effort; safe no-op if already flat.
+    """
+    # Discover dict-like columns
+    dict_cols = [c for c in df.columns if df[c].apply(lambda v: isinstance(v, dict)).any()]
+    out = df.copy()
+    for c in dict_cols:
+        expanded = pd.json_normalize(out[c]).add_prefix(strip_ns(c) + ".")
+        out = pd.concat([out.drop(columns=[c]), expanded], axis=1)
+    return out
 
+# =========================
+# Debug merge & packaging
+# =========================
 def _debug_merge_preview(members_df: pd.DataFrame, region_sheets: dict):
     """
-    Build a standardized region map, normalize member ZIPs, and merge — for debugging.
-    Returns: merged, zip_map_all, source_zip_col
+    Merge members_df with region_sheets by ZIP for a quick preview.
+    Returns (merged, zip_map_concat, src_zip_colname).
     """
-    # 1) Normalize members ZIP
-    members = members_df.copy()
-    source_col = _ensure_member_zip_column(members)  # creates Zip_clean
+    zip_map = []
+    for _, zdf in region_sheets.items():
+        # keep only Zip, County, Region
+        zdf2 = zdf[["Zip", "County", "Region"]].copy()
+        zip_map.append(zdf2)
+    region_map = pd.concat(zip_map, ignore_index=True).drop_duplicates(subset=["Zip"])
 
-    # 2) Standardize region map: expect County, Zip, Region in first 3 cols
-    zip_map_all = pd.DataFrame()
-    for _, df in region_sheets.items():
-        d = df.iloc[:, :3].copy()
-        d.columns = ["County", "Zip", "Region"]
-        zip_map_all = pd.concat([zip_map_all, d], ignore_index=True)
+    # detect source zip
+    src_zip = "Zip_clean" if "Zip_clean" in members_df.columns else None
+    merged = members_df.merge(region_map, left_on=src_zip, right_on="Zip", how="left") if src_zip else members_df.copy()
+    return merged, region_map, src_zip
 
-    # 3) Clean region zips
-    zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
-    zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
-    zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
-    zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
+def process_and_package(members_df: pd.DataFrame, region_sheets: dict) -> bytes:
+    """
+    Create one CSV per Region, plus summary sheets, and return a ZIP blob.
+    """
+    merged, region_map, src_zip = _debug_merge_preview(members_df, region_sheets)
 
-    # 4) Merge
-    merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
-    return merged, zip_map_all, source_col
+    # Prepare per-Region member CSVs
+    if "Region" in merged.columns:
+        regions = sorted(merged["Region"].dropna().unique().tolist())
+    else:
+        regions = []
 
-
-# =========================
-# Core processing
-# =========================
-def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
-    """Return a bytes ZIP containing per-region workbooks + unmatched workbook."""
-    # --- Normalize member ZIPs from any known column name ---
-    members = members.copy()
-    source_col = _ensure_member_zip_column(members)  # may be None if no ZIP-like column is present
-
-    # --- Build one tall map from all sheets (expecting County, Zip, Region) ---
-    zip_map_all = pd.DataFrame()
-    for _, df in region_sheets.items():
-        d = df.iloc[:, :3].copy()
-        d.columns = ["County", "Zip", "Region"]
-        zip_map_all = pd.concat([zip_map_all, d], ignore_index=True)
-
-    # Robust ZIP normalization on the region map (handles numbers-as-text, +4, etc.)
-    zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
-    zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
-    zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
-    zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
-
-    # --- Merge + group ---
-    merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
-    grouped = merged[merged["Region"].notna()].groupby("Region")
-
-    # UI: quick match stats
-    try:
-        matched = merged["Region"].notna().sum()
-        total = len(merged)
-        st.info(
-            f"Matched {matched} of {total} members to regions"
-            + (f" using '{source_col}'" if source_col else " (no ZIP column detected)")
-        )
-    except Exception:
-        pass
-
-    # --- Write ZIP archive of region files + unmatched ---
+    # Build ZIP in memory
     with tempfile.TemporaryDirectory() as tmpdir:
-        zip_path = os.path.join(tmpdir, "NYSAND_Member_Files.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for region, df in grouped:
-                safe_region = str(region).replace("/", "-").replace(" ", "_")
-                fname = f"{safe_region}_Members.xlsx"
-                fpath = os.path.join(tmpdir, fname)
-                df.to_excel(fpath, index=False)
-                zipf.write(fpath, arcname=fname)
+        zippath = os.path.join(tmpdir, "NYSAND_Member_Files.zip")
+        with zipfile.ZipFile(zippath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            # Per-region files
+            for r in regions:
+                r_df = merged[merged["Region"] == r].copy()
+                safe_r = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(r))
+                csv_path = os.path.join(tmpdir, f"members_{safe_r}.csv")
+                r_df.to_csv(csv_path, index=False)
+                zf.write(csv_path, arcname=f"regions/members_{safe_r}.csv")
 
-            unmatched = merged[merged["Region"].isna()]
-            unmatched_path = os.path.join(tmpdir, "Unmatched_OutOfState_Members.xlsx")
-            unmatched.to_excel(unmatched_path, index=False)
-            zipf.write(unmatched_path, arcname="Unmatched_OutOfState_Members.xlsx")
+            # Summary: merged, region_map, unmatched
+            merged_path = os.path.join(tmpdir, "merged_full.csv")
+            merged.to_csv(merged_path, index=False)
+            zf.write(merged_path, arcname="debug/merged_full.csv")
 
-        return open(zip_path, "rb").read()
+            map_path = os.path.join(tmpdir, "region_map_standardized.csv")
+            region_map.to_csv(map_path, index=False)
+            zf.write(map_path, arcname="debug/region_map_standardized.csv")
 
+            if "Region" in merged.columns:
+                unmatched = merged[merged["Region"].isna()].copy()
+            else:
+                unmatched = merged.copy()
+            um_path = os.path.join(tmpdir, "unmatched.csv")
+            unmatched.to_csv(um_path, index=False)
+            zf.write(um_path, arcname="debug/unmatched.csv")
+
+            # Optional: include a logo if present
+            logo_path = _find_logo()
+            if logo_path:
+                zf.write(logo_path, arcname="assets/logo.png")
+
+        with open(zippath, "rb") as f:
+            blob = f.read()
+    return blob
 
 # =========================
-# UI: Source selection
+# UI
 # =========================
+st.title("NYSAND Member Region Files")
+st.caption(
+    "Upload your **Member Export CSV** and the **NYSAND Region Zip...*, **or** fetch the member list via the EatRight SOAP API, then:"
+)
+st.markdown(
+    "- Inspect the merged data in **Debug**\n"
+    "- Download per-region CSVs in a single ZIP\n"
+    "- Download helpful intermediate CSVs"
+)
+
 with st.sidebar:
     source = st.radio("Data source", ["Manual Upload", "EatRight SOAP API"], index=0)
-    st.caption("Run API fetch first, then process into region files.")
 
 if source == "Manual Upload":
-    member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
+    st.subheader("Manual Upload")
+    members_csv = st.file_uploader("📥 Upload Member Export (CSV)", type=["csv"])
     region_file = st.file_uploader(
         "📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)",
         type=["xls", "xlsx"],
-        key="regionfile",
     )
+    if st.button("Process uploaded files", type="primary") and members_csv:
+        try:
+            members_df = pd.read_csv(members_csv)
+            members_df = _ensure_member_zip_column(members_df)
+            region_sheets = load_region_mapping(region_file)
+            if region_sheets is None:
+                st.error("Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo.")
+                st.stop()
 
-    if member_file:
-        region_sheets = load_region_mapping(region_file)
-        if region_sheets is None:
-            st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
-        else:
-            members_df = pd.read_csv(member_file)
+            merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(members_df, region_sheets)
 
-            # --- Debug: Inspect uploaded data and ZIP matching ---
-            with st.expander("🔎 Debug — Inspect uploaded data and ZIP matching", expanded=False):
+            with st.expander("🔎 Debug — Inspect upload & ZIP matching", expanded=True):
                 try:
-                    st.write("**Uploaded columns:**", list(members_df.columns))
+                    st.write("**Member columns:**", list(members_df.columns))
                     st.dataframe(members_df.head(10))
-
-                    merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(members_df, region_sheets)
-                    matched_ct = merged_dbg["Region"].notna().sum()
+                    matched_ct = merged_dbg["Region"].notna().sum() if "Region" in merged_dbg.columns else 0
                     total_ct = len(merged_dbg)
                     st.info(
                         f"Matched **{matched_ct:,} / {total_ct:,}** members"
-                        + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)")
+                        + (f" using ZIP column **{src_zip}**" if src_zip else "")
                     )
 
-                    # Downloads
+                    # Diagnostics / raw downloads
                     st.download_button(
-                        "⬇️ Download Uploaded RAW (csv)",
+                        "⬇️ Download Members RAW (csv)",
                         members_df.to_csv(index=False).encode("utf-8"),
-                        file_name="uploaded_raw.csv",
-                    )
-                    st.download_button(
-                        "⬇️ Download Members + Zip_clean (csv)",
-                        merged_dbg.drop(
-                            columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
-                            errors="ignore",
-                        ).to_csv(index=False).encode("utf-8"),
-                        file_name="members_with_zip_clean.csv",
+                        file_name="members_raw.csv",
                     )
                     st.download_button(
                         "⬇️ Download Region Map (standardized) (csv)",
@@ -490,16 +390,17 @@ if source == "Manual Upload":
                         merged_dbg.to_csv(index=False).encode("utf-8"),
                         file_name="merged_full.csv",
                     )
-                    st.download_button(
-                        "⬇️ Download MATCHED only (csv)",
-                        merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
-                        file_name="merged_matched_only.csv",
-                    )
-                    st.download_button(
-                        "⬇️ Download UNMATCHED only (csv)",
-                        merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
-                        file_name="merged_unmatched_only.csv",
-                    )
+                    if "Region" in merged_dbg.columns:
+                        st.download_button(
+                            "⬇️ Download MATCHED only (csv)",
+                            merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
+                            file_name="merged_matched_only.csv",
+                        )
+                        st.download_button(
+                            "⬇️ Download UNMATCHED only (csv)",
+                            merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
+                            file_name="merged_unmatched_only.csv",
+                        )
                 except Exception as e:
                     st.warning(f"Debug panel could not render: {e}")
 
@@ -549,7 +450,11 @@ elif source == "EatRight SOAP API":
             ak = st.secrets["EATR_ACCESS_KEY"].strip()
             gk = st.secrets["EATR_GROUP_KEY"].strip()
 
-            use_custom = st.checkbox("Include custom properties (slower, richer)", value=True, key="api_custom_props")
+            use_custom = st.checkbox(
+                "Include custom properties (slower, richer)",
+                value=True,
+                key="api_custom_props"
+            )
 
             with st.spinner("Fetching members from EatRight API…"):
                 api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
@@ -577,18 +482,7 @@ elif source == "EatRight SOAP API":
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
         except Exception as e:
             st.error(f"API fetch failed: {e}")
-            # expose last SOAP XML if available
-            try:
-                with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
-                    raw_xml = f.read()
-                st.download_button(
-                    "⬇️ Download last SOAP response (xml)",
-                    raw_xml.encode("utf-8"),
-                    file_name="soap_response.xml",
-                    key="dl_last_soap_xml_err",
-                )
-            except Exception:
-                pass
+            st.exception(e)
 
     # ---------- Render from session_state on every rerun ----------
     if st.session_state["api_df"] is not None:
@@ -679,91 +573,3 @@ elif source == "EatRight SOAP API":
             file_name=f"NYSAND_Member_Files_{today}.zip",
             key="dl_region_zip",
         )
-
-
-        except KeyError as e:
-            st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
-        except Exception as e:
-            st.error(f"API fetch failed: {e}")
-            # Still try to expose the last SOAP body to help diagnose
-            try:
-                with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
-                    raw_xml = f.read()
-                st.download_button(
-                    "⬇️ Download last SOAP response (xml)",
-                    raw_xml.encode("utf-8"),
-                    file_name="soap_response.xml",
-                )
-            except Exception:
-                pass
-
-
-            region_sheets = load_region_mapping(region_file)
-            if region_sheets is None:
-                st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
-                st.stop()
-
-            # --- DEBUG PANEL: inspect API data and merge behavior ---
-            with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
-                st.write("**API columns:**", list(api_df.columns))
-                st.dataframe(api_df.head(10))
-
-                merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
-                matched_ct = merged_dbg["Region"].notna().sum()
-                total_ct = len(merged_dbg)
-                st.info(
-                    f"Matched **{matched_ct:,} / {total_ct:,}** members"
-                    + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)")
-                )
-
-                # Downloads
-                st.download_button(
-                    "⬇️ Download RAW API (csv)",
-                    api_df.to_csv(index=False).encode("utf-8"),
-                    file_name="api_raw.csv",
-                )
-                members_with_zip = merged_dbg.drop(
-                    columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
-                    errors="ignore",
-                )
-                st.download_button(
-                    "⬇️ Download Members + Zip_clean (csv)",
-                    members_with_zip.to_csv(index=False).encode("utf-8"),
-                    file_name="members_with_zip_clean.csv",
-                )
-                st.download_button(
-                    "⬇️ Download Region Map (standardized) (csv)",
-                    zip_map_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="region_map_standardized.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MERGED (full) (csv)",
-                    merged_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="merged_full.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_matched_only.csv",
-                )
-                st.download_button(
-                    "⬇️ Download UNMATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_unmatched_only.csv",
-                )
-
-            # --- Create outputs ---
-            with st.spinner("Creating region files…"):
-                blob = process_and_package(api_df, region_sheets)
-            today = datetime.now().strftime("%Y-%m-%d")
-            st.success("✅ Done! Download your ZIP below.")
-            st.download_button(
-                "📥 Download All Files (ZIP)",
-                blob,
-                file_name=f"NYSAND_Member_Files_{today}.zip",
-            )
-        except KeyError as e:
-            st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
-        except Exception as e:
-            st.error(f"API fetch failed: {e}")
-            st.exception(e)
