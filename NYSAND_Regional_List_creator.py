@@ -62,6 +62,48 @@ API_NS  = "http://eatright/membership"
 # Per ADA docs, use HTTP only (their HTTPS certificate has expired)
 ENDPOINT = "http://ws.eatright.org/service/service.svc"
 
+# --- WSDL action map helpers ---
+WSDL_URL = "http://ws.eatright.org/service/service.svc?wsdl"
+
+def _wsdl_actions_map() -> dict:
+    """Return {operationName: [soapAction, ...]} by parsing the WSDL (best-effort)."""
+    import requests, xmltodict
+    try:
+        r = requests.get(WSDL_URL, timeout=60)
+        r.raise_for_status()
+        doc = xmltodict.parse(r.text)
+    except Exception:
+        return {}
+
+    actions = {}
+    defs = doc.get("wsdl:definitions") or doc.get("definitions") or {}
+    bindings = defs.get("wsdl:binding") or defs.get("binding") or []
+    if isinstance(bindings, dict):
+        bindings = [bindings]
+    for b in bindings:
+        ops = b.get("wsdl:operation") or b.get("operation") or []
+        if isinstance(ops, dict):
+            ops = [ops]
+        for op in ops:
+            name = op.get("@name")
+            if not name:
+                continue
+            # SOAP 1.1
+            soap_op = op.get("soap:operation")
+            if isinstance(soap_op, dict) and "@soapAction" in soap_op:
+                actions.setdefault(name, []).append(soap_op["@soapAction"])
+            # SOAP 1.2
+            soap12_op = op.get("soap12:operation")
+            if isinstance(soap12_op, dict) and "@soapAction" in soap12_op:
+                actions.setdefault(name, []).append(soap12_op["@soapAction"])
+    return actions
+
+_WSDL_ACTIONS = _wsdl_actions_map()
+
+def _wsdl_action_for(method: str) -> list[str]:
+    return _WSDL_ACTIONS.get(method, [])
+
+
 # --- Keep this header builder exactly as is ---
 def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
     header = (
@@ -81,82 +123,65 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
-
 def _post_soap(action: str, envelope_xml: str) -> dict:
     """
-    Robust SOAP POST over HTTP that tries several WCF-compatible action/header variants.
-    Stops at the first successful response and surfaces SOAP Faults clearly.
+    SOAP 1.1 over HTTP only.
+    1) Try WSDL-declared soapAction(s), quoted.
+    2) Fall back to known WCF patterns, quoted (no SOAP 1.2).
+    Surfaces SOAP Faults or raw body on error.
     """
     import requests, xmltodict
 
-    # Candidate SOAPAction values seen with WCF services
     base = API_NS  # "http://eatright/membership"
-    action_candidates = [
-        f"\"{base}/{action}\"",             # "http://eatright/membership/ValidateAccessKey"
-        f"\"{base}/IService/{action}\"",    # "http://eatright/membership/IService/ValidateAccessKey"
-        f"{base}/{action}",                 # unquoted (some stacks accept this)
-        "",                                 # empty SOAPAction (occasionally accepted)
+
+    # Prioritize WSDL-declared actions (if any)
+    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # dedupe, preserve order
+
+    # Fallback patterns commonly seen in WCF
+    candidates += [
+        f"{base}/{action}",
+        f"{base}/IService/{action}",
+        f"{base}/IWcfAdaMembership/{action}",
+        "",  # empty SOAPAction (some WCF allow this)
     ]
 
-    # Two header styles to try:
-    #  - SOAP 1.1: text/xml + SOAPAction header
-    #  - SOAP 1.2: application/soap+xml with action= param (no SOAPAction header)
-    header_styles = [
-        ("1.1", lambda sa: {
+    errors = []
+    for sa in candidates:
+        headers = {
             "Content-Type": "text/xml; charset=utf-8",
             "Accept": "text/xml",
-            "SOAPAction": sa,
-        }),
-        ("1.2", lambda sa, b=base, a=action: {
-            # SOAP 1.2 uses the “action=” parameter in Content-Type instead of a SOAPAction header
-            "Content-Type": (
-                f'application/soap+xml; charset=utf-8; action="{b}/{a}"'
-                if not sa else
-                f'application/soap+xml; charset=utf-8; action={sa}'
-            ),
-            "Accept": "application/soap+xml",
-        }),
-    ]
+        }
+        # SOAP 1.1 uses SOAPAction header; WCF prefers it quoted
+        if sa is not None:
+            headers["SOAPAction"] = f"\"{sa}\"" if sa else ""
 
-
-    last_err = None
-    for ver, header_maker in header_styles:
-        for sa in action_candidates:
-            headers = header_maker(sa)
-            try:
-                r = requests.post(
-                    ENDPOINT,
-                    data=envelope_xml.encode("utf-8"),
-                    headers=headers,
-                    timeout=60
-                )
-
-                # If a SOAP Fault returns with 500, extract faultstring for clarity
-                if r.status_code >= 400:
-                    try:
-                        doc = xmltodict.parse(r.text)
-                        fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
-                                 or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
-                        if fault:
-                            fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
-                            raise RuntimeError(f"{ver} {('with SOAPAction ' + sa) if sa else '(no SOAPAction)'} → SOAP Fault: {fs}")
-                    except Exception:
-                        # Not a parseable SOAP fault; include raw snippet
-                        snippet = (r.text or "").strip()
-                        if len(snippet) > 1200:
-                            snippet = snippet[:1200] + " …(truncated)…"
-                        raise RuntimeError(f"{ver} {('with SOAPAction ' + sa) if sa else '(no SOAPAction)'} → HTTP {r.status_code}. Body:\n{snippet}")
-
-                # Success path: parse XML to dict and return
-                return xmltodict.parse(r.text)
-
-            except Exception as e:
-                last_err = e
+        try:
+            r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
+            if r.status_code >= 400:
+                # Try to extract a SOAP Fault
+                try:
+                    doc = xmltodict.parse(r.text)
+                    fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
+                             or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
+                    if fault:
+                        fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
+                        errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → Fault: {fs}")
+                        continue
+                except Exception:
+                    pass
+                snippet = (r.text or "").strip()
+                if len(snippet) > 1200:
+                    snippet = snippet[:1200] + " …(truncated)…"
+                errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → HTTP {r.status_code}: {snippet}")
                 continue
 
-    # If we exhausted all variants:
-    raise last_err or RuntimeError("All SOAP variants failed (action/header mismatch).")
+            # Success — parse and return
+            return xmltodict.parse(r.text)
 
+        except Exception as e:
+            errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → {e}")
+
+    raise RuntimeError(" / ".join(errors) or "All SOAP 1.1 variants failed.")
 
 
 def _validate_access_key(access_key: str) -> bool:
