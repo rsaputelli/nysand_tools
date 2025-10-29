@@ -81,10 +81,6 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
-# --- Replace everything below this comment with the HTTP-only version ---
-SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
-API_NS  = "http://eatright/membership"
-ENDPOINT = "http://ws.eatright.org/service/service.svc"  # HTTP only
 
 def _post_soap(action: str, envelope_xml: str) -> dict:
     """
