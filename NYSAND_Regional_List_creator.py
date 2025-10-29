@@ -517,49 +517,116 @@ elif source == "EatRight SOAP API":
         key="regionfile_api",
     )
 
-if st.button("🔄 Fetch members via API"):
-    try:
-        ak = st.secrets["EATR_ACCESS_KEY"].strip()
-        gk = st.secrets["EATR_GROUP_KEY"].strip()
-
-        # Checkbox toggle to include/exclude custom properties
-        use_custom = st.checkbox(
-            "Include custom properties (slower, richer)", value=True
-        )
-
-        with st.spinner("Fetching members from EatRight API…"):
-            api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
-
-        st.success(f"Fetched {len(api_df):,} records.")
-        st.dataframe(api_df.head(25))
-
-        # Allow download of last SOAP response for debugging
+    if st.button("🔄 Fetch members via API"):
         try:
-            with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
-                raw_xml = f.read()
+            ak = st.secrets["EATR_ACCESS_KEY"].strip()
+            gk = st.secrets["EATR_GROUP_KEY"].strip()
+
+            # Include/exclude custom props
+            use_custom = st.checkbox("Include custom properties (slower, richer)", value=True)
+
+            with st.spinner("Fetching members from EatRight API…"):
+                api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
+
+            st.success(f"Fetched {len(api_df):,} records.")
+            st.dataframe(api_df.head(25))
+
+            # Offer the raw SOAP xml (from last call) for download
+            try:
+                with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
+                    raw_xml = f.read()
+                st.download_button(
+                    "⬇️ Download last SOAP response (xml)",
+                    raw_xml.encode("utf-8"),
+                    file_name="soap_response.xml",
+                )
+            except Exception:
+                pass
+
+            # Load region map (uploaded overrides bundled)
+            region_sheets = load_region_mapping(region_file)
+            if region_sheets is None:
+                st.error(
+                    "Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo."
+                )
+                st.stop()
+
+            # ---- DEBUG panel (always available after a successful fetch)
+            with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
+                st.write("**API columns:**", list(api_df.columns))
+                st.dataframe(api_df.head(10))
+
+                merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
+                matched_ct = merged_dbg["Region"].notna().sum()
+                total_ct = len(merged_dbg)
+                st.info(
+                    f"Matched **{matched_ct:,} / {total_ct:,}** members"
+                    + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)")
+                )
+
+                # Diagnostics / raw downloads
+                st.download_button(
+                    "⬇️ Download RAW API (csv)",
+                    api_df.to_csv(index=False).encode("utf-8"),
+                    file_name="api_raw.csv",
+                )
+                members_with_zip = merged_dbg.drop(
+                    columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
+                    errors="ignore",
+                )
+                st.download_button(
+                    "⬇️ Download Members + Zip_clean (csv)",
+                    members_with_zip.to_csv(index=False).encode("utf-8"),
+                    file_name="members_with_zip_clean.csv",
+                )
+                st.download_button(
+                    "⬇️ Download Region Map (standardized) (csv)",
+                    zip_map_dbg.to_csv(index=False).encode("utf-8"),
+                    file_name="region_map_standardized.csv",
+                )
+                st.download_button(
+                    "⬇️ Download MERGED (full) (csv)",
+                    merged_dbg.to_csv(index=False).encode("utf-8"),
+                    file_name="merged_full.csv",
+                )
+                st.download_button(
+                    "⬇️ Download MATCHED only (csv)",
+                    merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
+                    file_name="merged_matched_only.csv",
+                )
+                st.download_button(
+                    "⬇️ Download UNMATCHED only (csv)",
+                    merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
+                    file_name="merged_unmatched_only.csv",
+                )
+
+            # ---- Create and offer the region ZIP ("Process into region files")
+            with st.spinner("Creating region files…"):
+                blob = process_and_package(api_df, region_sheets)
+            today = datetime.now().strftime("%Y-%m-%d")
+            st.success("✅ Done! Download your ZIP below.")
             st.download_button(
-                "⬇️ Download last SOAP response (xml)",
-                raw_xml.encode("utf-8"),
-                file_name="soap_response.xml"
+                "📥 Download All Files (ZIP)",
+                blob,
+                file_name=f"NYSAND_Member_Files_{today}.zip",
             )
-        except Exception:
-            pass
 
-    except Exception as e:
-        st.error(f"API fetch failed: {e}")
+        except KeyError as e:
+            st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
+        except Exception as e:
+            st.error(f"API fetch failed: {e}")
+            # Still try to expose the last SOAP body to help diagnose
+            try:
+                with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
+                    raw_xml = f.read()
+                st.download_button(
+                    "⬇️ Download last SOAP response (xml)",
+                    raw_xml.encode("utf-8"),
+                    file_name="soap_response.xml",
+                )
+            except Exception:
+                pass
 
-
-        # Allow download of last SOAP response for debugging
-        try:
-            with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
-                raw_xml = f.read()
-            st.download_button(
-                "⬇️ Download last SOAP response (xml)",
-                raw_xml.encode("utf-8"),
-                file_name="soap_response.xml"
-            )
-        except Exception:
-            pass
 
             region_sheets = load_region_mapping(region_file)
             if region_sheets is None:
