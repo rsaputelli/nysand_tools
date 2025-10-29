@@ -290,6 +290,32 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
     df["Zip"] = df[candidate_cols[0]] if candidate_cols else None
 
     return df
+    
+def _debug_merge_preview(members_df: pd.DataFrame, region_sheets: dict):
+    """
+    Build a standardized region map, normalize member ZIPs, and merge — for debugging.
+    Returns: merged, zip_map_all, source_zip_col
+    """
+    # 1) Normalize members ZIP
+    members = members_df.copy()
+    source_col = _ensure_member_zip_column(members)  # creates Zip_clean
+
+    # 2) Standardize region map: expect County, Zip, Region in first 3 cols
+    zip_map_all = pd.DataFrame()
+    for _, df in region_sheets.items():
+        d = df.iloc[:, :3].copy()
+        d.columns = ["County", "Zip", "Region"]
+        zip_map_all = pd.concat([zip_map_all, d], ignore_index=True)
+
+    # 3) Clean region zips
+    zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
+    zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
+    zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
+    zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
+
+    # 4) Merge
+    merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
+    return merged, zip_map_all, source_col
 
 
 # =========================
@@ -392,6 +418,38 @@ elif source == "EatRight SOAP API":
             if region_sheets is None:
                 st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
                 st.stop()
+            # --- DEBUG PANEL: inspect API data and merge behavior ---
+            with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
+                st.write("**API columns:**", list(api_df.columns))
+                st.dataframe(api_df.head(10))
+
+                merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
+                matched_ct = merged_dbg["Region"].notna().sum()
+                total_ct = len(merged_dbg)
+                st.info(f"Matched **{matched_ct:,} / {total_ct:,}** members"
+                        + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)"))
+
+                # Downloads
+                st.download_button("⬇️ Download RAW API (csv)",
+                                   api_df.to_csv(index=False).encode("utf-8"),
+                                   file_name="api_raw.csv")
+                # members with Zip_clean (from preview helper)
+                members_with_zip = merged_dbg.drop(columns=[c for c in ["County","Region","Zip_y"] if c in merged_dbg.columns], errors="ignore")
+                st.download_button("⬇️ Download Members + Zip_clean (csv)",
+                                   members_with_zip.to_csv(index=False).encode("utf-8"),
+                                   file_name="members_with_zip_clean.csv")
+                st.download_button("⬇️ Download Region Map (standardized) (csv)",
+                                   zip_map_dbg.to_csv(index=False).encode("utf-8"),
+                                   file_name="region_map_standardized.csv")
+                st.download_button("⬇️ Download MERGED (full) (csv)",
+                                   merged_dbg.to_csv(index=False).encode("utf-8"),
+                                   file_name="merged_full.csv")
+                st.download_button("⬇️ Download MATCHED only (csv)",
+                                   merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
+                                   file_name="merged_matched_only.csv")
+                st.download_button("⬇️ Download UNMATCHED only (csv)",
+                                   merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
+                                   file_name="merged_unmatched_only.csv")
 
             with st.spinner("Creating region files…"):
                 blob = process_and_package(api_df, region_sheets)
@@ -403,6 +461,37 @@ elif source == "EatRight SOAP API":
                     file_name=f"NYSAND_Member_Files_{today}.zip"
                 )
 
+            with st.expander("🔎 Debug — Inspect uploaded data and ZIP matching", expanded=False):
+            st.write("**Uploaded columns:**", list(members_df.columns))
+            st.dataframe(members_df.head(10))
+
+            merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(members_df, region_sheets)
+            matched_ct = merged_dbg["Region"].notna().sum()
+            total_ct = len(merged_dbg)
+            st.info(f"Matched **{matched_ct:,} / {total_ct:,}** members"
+                    + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)"))
+
+            st.download_button("⬇️ Download Uploaded RAW (csv)",
+                               members_df.to_csv(index=False).encode("utf-8"),
+                               file_name="uploaded_raw.csv")
+            st.download_button("⬇️ Download Members + Zip_clean (csv)",
+                               merged_dbg.drop(columns=[c for c in ["County","Region","Zip_y"] if c in merged_dbg.columns], errors="ignore")
+                                         .to_csv(index=False).encode("utf-8"),
+                               file_name="members_with_zip_clean.csv")
+            st.download_button("⬇️ Download Region Map (standardized) (csv)",
+                               zip_map_dbg.to_csv(index=False).encode("utf-8"),
+                               file_name="region_map_standardized.csv")
+            st.download_button("⬇️ Download MERGED (full) (csv)",
+                               merged_dbg.to_csv(index=False).encode("utf-8"),
+                               file_name="merged_full.csv")
+            st.download_button("⬇️ Download MATCHED only (csv)",
+                               merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
+                               file_name="merged_matched_only.csv")
+            st.download_button("⬇️ Download UNMATCHED only (csv)",
+                               merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
+                               file_name="merged_unmatched_only.csv")
+
+                
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
         except Exception as e:
