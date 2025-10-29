@@ -517,26 +517,37 @@ elif source == "EatRight SOAP API":
         key="regionfile_api",
     )
 
-    if st.button("🔄 Fetch members via API"):
-        try:
-            ak = st.secrets["EATR_ACCESS_KEY"].strip()
-            gk = st.secrets["EATR_GROUP_KEY"].strip()
+if st.button("🔄 Fetch members via API"):
+    try:
+        ak = st.secrets["EATR_ACCESS_KEY"].strip()
+        gk = st.secrets["EATR_GROUP_KEY"].strip()
 
+        # Checkbox toggle to include/exclude custom properties
         use_custom = st.checkbox(
             "Include custom properties (slower, richer)", value=True
         )
 
         with st.spinner("Fetching members from EatRight API…"):
             api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
-            
-            
-            with st.spinner("Validating AccessKey…"):
-                if not _validate_access_key(ak):
-                    st.error("AccessKey invalid. Check Vendor Access in the portal.")
-                    st.stop()
 
-            st.success(f"Fetched {len(api_df):,} records.")
-            st.dataframe(api_df.head(25))
+        st.success(f"Fetched {len(api_df):,} records.")
+        st.dataframe(api_df.head(25))
+
+        # Allow download of last SOAP response for debugging
+        try:
+            with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
+                raw_xml = f.read()
+            st.download_button(
+                "⬇️ Download last SOAP response (xml)",
+                raw_xml.encode("utf-8"),
+                file_name="soap_response.xml"
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        st.error(f"API fetch failed: {e}")
+
 
         # Allow download of last SOAP response for debugging
         try:
