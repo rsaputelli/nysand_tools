@@ -511,27 +511,73 @@ if source == "Manual Upload":
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
+
+    # ---------- Session persistence keys ----------
+    _STATE_KEYS = [
+        "api_df",          # pd.DataFrame of raw members
+        "merged_dbg",      # pd.DataFrame merged with regions (for debug)
+        "zip_map_dbg",     # pd.DataFrame standardized region map
+        "src_zip",         # str of the detected ZIP column
+        "region_blob",     # bytes of the generated ZIP file
+        "fetched_on",      # timestamp string
+    ]
+    for k in _STATE_KEYS:
+        st.session_state.setdefault(k, None)
+
+    # Optional region map override
     region_file = st.file_uploader(
         "📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)",
         type=["xls", "xlsx"],
         key="regionfile_api",
     )
 
-    if st.button("🔄 Fetch members via API"):
+    cols = st.columns([1,1,1])
+    with cols[0]:
+        do_fetch = st.button("🔄 Fetch members via API", type="primary")
+    with cols[1]:
+        do_reset = st.button("🧹 Reset session")
+
+    if do_reset:
+        for k in _STATE_KEYS:
+            st.session_state[k] = None
+        st.success("Session cleared. You can fetch again.")
+        st.stop()
+
+    # ---------- On-demand fetch (write into session_state) ----------
+    if do_fetch:
         try:
             ak = st.secrets["EATR_ACCESS_KEY"].strip()
             gk = st.secrets["EATR_GROUP_KEY"].strip()
 
-            # Include/exclude custom props
-            use_custom = st.checkbox("Include custom properties (slower, richer)", value=True)
+            use_custom = st.checkbox("Include custom properties (slower, richer)", value=True, key="api_custom_props")
 
             with st.spinner("Fetching members from EatRight API…"):
                 api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
 
-            st.success(f"Fetched {len(api_df):,} records.")
-            st.dataframe(api_df.head(25))
+            region_sheets = load_region_mapping(region_file)
+            if region_sheets is None:
+                st.error("Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo.")
+                st.stop()
 
-            # Offer the raw SOAP xml (from last call) for download
+            merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
+
+            with st.spinner("Creating region files…"):
+                region_blob = process_and_package(api_df, region_sheets)
+
+            # Persist to session so downloads don't disappear on rerun
+            st.session_state["api_df"] = api_df
+            st.session_state["merged_dbg"] = merged_dbg
+            st.session_state["zip_map_dbg"] = zip_map_dbg
+            st.session_state["src_zip"] = src_zip
+            st.session_state["region_blob"] = region_blob
+            st.session_state["fetched_on"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            st.success(f"Fetched {len(api_df):,} records and built region files.")
+        except KeyError as e:
+            st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
+        except Exception as e:
+            st.error(f"API fetch failed: {e}")
+            # expose last SOAP XML if available
             try:
                 with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
                     raw_xml = f.read()
@@ -539,77 +585,101 @@ elif source == "EatRight SOAP API":
                     "⬇️ Download last SOAP response (xml)",
                     raw_xml.encode("utf-8"),
                     file_name="soap_response.xml",
+                    key="dl_last_soap_xml_err",
                 )
             except Exception:
                 pass
 
-            # Load region map (uploaded overrides bundled)
-            region_sheets = load_region_mapping(region_file)
-            if region_sheets is None:
-                st.error(
-                    "Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo."
-                )
-                st.stop()
+    # ---------- Render from session_state on every rerun ----------
+    if st.session_state["api_df"] is not None:
+        api_df = st.session_state["api_df"]
+        merged_dbg = st.session_state["merged_dbg"]
+        zip_map_dbg = st.session_state["zip_map_dbg"]
+        src_zip = st.session_state["src_zip"]
+        region_blob = st.session_state["region_blob"]
+        fetched_on = st.session_state["fetched_on"]
 
-            # ---- DEBUG panel (always available after a successful fetch)
-            with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
-                st.write("**API columns:**", list(api_df.columns))
-                st.dataframe(api_df.head(10))
+        st.info(f"Session has {len(api_df):,} members. Last fetched: {fetched_on}")
 
-                merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
-                matched_ct = merged_dbg["Region"].notna().sum()
-                total_ct = len(merged_dbg)
-                st.info(
-                    f"Matched **{matched_ct:,} / {total_ct:,}** members"
-                    + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)")
-                )
+        st.dataframe(api_df.head(25))
 
-                # Diagnostics / raw downloads
-                st.download_button(
-                    "⬇️ Download RAW API (csv)",
-                    api_df.to_csv(index=False).encode("utf-8"),
-                    file_name="api_raw.csv",
-                )
-                members_with_zip = merged_dbg.drop(
-                    columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
-                    errors="ignore",
-                )
-                st.download_button(
-                    "⬇️ Download Members + Zip_clean (csv)",
-                    members_with_zip.to_csv(index=False).encode("utf-8"),
-                    file_name="members_with_zip_clean.csv",
-                )
-                st.download_button(
-                    "⬇️ Download Region Map (standardized) (csv)",
-                    zip_map_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="region_map_standardized.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MERGED (full) (csv)",
-                    merged_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="merged_full.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_matched_only.csv",
-                )
-                st.download_button(
-                    "⬇️ Download UNMATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_unmatched_only.csv",
-                )
-
-            # ---- Create and offer the region ZIP ("Process into region files")
-            with st.spinner("Creating region files…"):
-                blob = process_and_package(api_df, region_sheets)
-            today = datetime.now().strftime("%Y-%m-%d")
-            st.success("✅ Done! Download your ZIP below.")
+        # Optional: Last SOAP XML (if your fetcher wrote it)
+        try:
+            with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
+                raw_xml = f.read()
             st.download_button(
-                "📥 Download All Files (ZIP)",
-                blob,
-                file_name=f"NYSAND_Member_Files_{today}.zip",
+                "⬇️ Download last SOAP response (xml)",
+                raw_xml.encode("utf-8"),
+                file_name="soap_response.xml",
+                key="dl_last_soap_xml_ok",
             )
+        except Exception:
+            pass
+
+        # ---- Debug expander
+        with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
+            st.write("**API columns:**", list(api_df.columns))
+            st.dataframe(api_df.head(10))
+
+            matched_ct = merged_dbg["Region"].notna().sum() if "Region" in merged_dbg.columns else 0
+            total_ct = len(merged_dbg)
+            st.info(
+                f"Matched **{matched_ct:,} / {total_ct:,}** members"
+                + (f" using ZIP column **{src_zip}**" if src_zip else "")
+            )
+
+            # Diagnostics / raw downloads (persist across reruns)
+            st.download_button(
+                "⬇️ Download RAW API (csv)",
+                api_df.to_csv(index=False).encode("utf-8"),
+                file_name="api_raw.csv",
+                key="dl_api_raw",
+            )
+
+            members_with_zip = merged_dbg.drop(
+                columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
+                errors="ignore",
+            )
+            st.download_button(
+                "⬇️ Download Members + Zip_clean (csv)",
+                members_with_zip.to_csv(index=False).encode("utf-8"),
+                file_name="members_with_zip_clean.csv",
+                key="dl_zip_clean",
+            )
+            st.download_button(
+                "⬇️ Download Region Map (standardized) (csv)",
+                zip_map_dbg.to_csv(index=False).encode("utf-8"),
+                file_name="region_map_standardized.csv",
+                key="dl_region_map",
+            )
+            st.download_button(
+                "⬇️ Download MERGED (full) (csv)",
+                merged_dbg.to_csv(index=False).encode("utf-8"),
+                file_name="merged_full.csv",
+                key="dl_merged_full",
+            )
+            st.download_button(
+                "⬇️ Download MATCHED only (csv)",
+                merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
+                file_name="merged_matched_only.csv",
+                key="dl_matched",
+            )
+            st.download_button(
+                "⬇️ Download UNMATCHED only (csv)",
+                merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
+                file_name="merged_unmatched_only.csv",
+                key="dl_unmatched",
+            )
+
+        # ---- Region ZIP download (persists)
+        today = datetime.now().strftime("%Y-%m-%d")
+        st.download_button(
+            "📥 Download All Files (ZIP)",
+            region_blob,
+            file_name=f"NYSAND_Member_Files_{today}.zip",
+            key="dl_region_zip",
+        )
+
 
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
