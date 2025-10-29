@@ -103,6 +103,39 @@ _WSDL_ACTIONS = _wsdl_actions_map()
 def _wsdl_action_for(method: str) -> list[str]:
     return _WSDL_ACTIONS.get(method, [])
 
+def _clean_zip(z):
+    import re
+    if z is None: return None
+    s = str(z).strip()
+    if not s: return None
+    # Keep first 5 digits only (drop +4 or any non-digits)
+    m = re.search(r"\d{5}", s)
+    if not m: return None
+    return m.group(0)
+
+# Accept any plausible ZIP field name that could come from API or CSV/XLSX
+ZIP_CANDIDATE_COLS = [
+    "Zip", "ZIP", "zip",
+    "PostalCode", "Postal Code", "postal_code", "postal", "postal code",
+    "ZipCode", "Zip Code", "zipcode", "ZIPCODE",
+]
+
+def _ensure_member_zip_column(members_df: pd.DataFrame) -> str | None:
+    """
+    Ensure members_df has a 'Zip_clean' column, derived from any plausible ZIP field.
+    Returns the source column name if found, else None.
+    """
+    for c in ZIP_CANDIDATE_COLS:
+        if c in members_df.columns:
+            z = members_df[c].map(_clean_zip)
+            if z.notna().any():
+                members_df["Zip_clean"] = z.astype(str).str.zfill(5)
+                return c
+    # No usable ZIP found; still create the column so downstream code runs
+    members_df["Zip_clean"] = None
+    return None
+
+
 
 # --- Keep this header builder exactly as is ---
 def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
@@ -279,26 +312,59 @@ def _clean_zip(zipcode):
         return None
     m = re.search(r"\b\d{5}\b", str(zipcode))
     return m.group(0) if m else None
+    
+# 1) Normalize member ZIPs from any known column name
+source_col = _ensure_member_zip_column(members)
+if source_col is None:
+    # No usable ZIP column found — everything will be unmatched
+    pass  # We still proceed so you get a clean Unmatched file
+
+# 2) Normalize region ZIPs to 5-digit strings (handles text/numeric)
+zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
+zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
+zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
+zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
+
+# 3) Merge
+merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
+    
 
 def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
     import zipfile, tempfile, os
-    # Clean ZIP and build Zip_clean used for merge
-    members = members.copy()
-    members["Zip_clean"] = members["Zip"].apply(_clean_zip)
 
-    # Build one tall map from all sheets (first 3 columns: County, Zip, Region)
+    # --- Normalize member ZIPs from any known column name ---
+    members = members.copy()
+    source_col = _ensure_member_zip_column(members)  # may be None if no ZIP-like column is present
+
+    # --- Build one tall map from all sheets (expecting County, Zip, Region) ---
     zip_map_all = pd.DataFrame()
     for _, df in region_sheets.items():
-        df = df.iloc[:, :3].copy()
-        df.columns = ["County", "Zip", "Region"]
-        df["Zip"] = df["Zip"].astype(str).str.zfill(5)
-        zip_map_all = pd.concat([zip_map_all, df], ignore_index=True)
+        d = df.iloc[:, :3].copy()
+        d.columns = ["County", "Zip", "Region"]
+        zip_map_all = pd.concat([zip_map_all, d], ignore_index=True)
 
-    # Merge + group
+    # Robust ZIP normalization on the region map (handles numbers-as-text, +4, etc.)
+    zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
+    zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
+    zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
+    # If the same ZIP appears on multiple sheets, keep the first occurrence
+    zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
+
+    # --- Merge + group ---
     merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
     grouped = merged[merged["Region"].notna()].groupby("Region")
 
-    # Write ZIP archive of region files + unmatched
+    # (Optional) quick match stats in Streamlit UI
+    try:
+        import streamlit as st
+        matched = merged["Region"].notna().sum()
+        total = len(merged)
+        st.info(f"Matched {matched} of {total} members to regions"
+                + (f" using '{source_col}'" if source_col else " (no ZIP column detected)"))
+    except Exception:
+        pass
+
+    # --- Write ZIP archive of region files + unmatched ---
     with tempfile.TemporaryDirectory() as tmpdir:
         zip_path = os.path.join(tmpdir, "NYSAND_Member_Files.zip")
         with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -315,6 +381,7 @@ def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
             zipf.write(unmatched_path, arcname="Unmatched_OutOfState_Members.xlsx")
 
         return open(zip_path, "rb").read()
+
 
 
 # =========================
