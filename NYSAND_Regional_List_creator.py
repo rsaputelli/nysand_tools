@@ -109,13 +109,6 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
 
     return xmltodict.parse(r.text)
 
-
-        except Exception as e:
-            last_err = e
-            continue
-    # If both endpoints failed:
-    raise last_err
-
 def _validate_access_key(access_key: str) -> bool:
     body = f"""
     <ValidateAccessKey xmlns="{API_NS}">
