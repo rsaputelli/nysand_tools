@@ -87,15 +87,19 @@ API_NS  = "http://eatright/membership"
 ENDPOINT = "http://ws.eatright.org/service/service.svc"  # HTTP only
 
 def _post_soap(action: str, envelope_xml: str) -> dict:
+    """SOAP 1.1 POST over HTTP only, quote SOAPAction (WCF-friendly), and show body on 500."""
     import requests, xmltodict
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "Accept": "text/xml",
-        "SOAPAction": f"{API_NS}/{action}",
+        # WCF is picky; quoting the action helps: "http://eatright/membership/ValidateAccessKey"
+        "SOAPAction": f"\"{API_NS}/{action}\"",
     }
+
     r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
 
     if r.status_code >= 400:
+        # Try to parse a SOAP Fault; if not, surface raw body
         try:
             doc = xmltodict.parse(r.text)
             fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
@@ -104,10 +108,14 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
                 faultstring = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
                 raise RuntimeError(f"SOAP Fault: {faultstring}")
         except Exception:
-            pass
-        r.raise_for_status()
+            # Not a parseable SOAP Fault — raise with response snippet so it shows in the UI
+            snippet = (r.text or "").strip()
+            if len(snippet) > 1200:
+                snippet = snippet[:1200] + " …(truncated)…"
+            raise RuntimeError(f"HTTP {r.status_code} from {ENDPOINT}. Body:\n{snippet}")
 
     return xmltodict.parse(r.text)
+
 
 def _validate_access_key(access_key: str) -> bool:
     body = f"""
@@ -277,8 +285,8 @@ elif source == "EatRight SOAP API":
     fetch_clicked = st.button("🔄 Fetch members via API")
     if fetch_clicked:
         try:
-            ak = st.secrets["EATR_ACCESS_KEY"]
-            gk = st.secrets["EATR_GROUP_KEY"]
+            ak = st.secrets["EATR_ACCESS_KEY"].strip()
+            gk = st.secrets["EATR_GROUP_KEY"].strip()
 
             with st.spinner("Validating AccessKey…"):
                 if not _validate_access_key(ak):
