@@ -59,12 +59,10 @@ Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**,
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
 
-# Per ADA docs the public service endpoint is HTTP; we try HTTP first, then HTTPS.
-ENDPOINTS = [
-    "http://ws.eatright.org/service/service.svc",
-    "https://ws.eatright.org/service/service.svc",
-]
+# Per ADA docs, use HTTP only (their HTTPS certificate has expired)
+ENDPOINT = "http://ws.eatright.org/service/service.svc"
 
+# --- Keep this header builder exactly as is ---
 def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
     header = (
         f"""
@@ -83,48 +81,34 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
+# --- Replace everything below this comment with the HTTP-only version ---
+SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+API_NS  = "http://eatright/membership"
+ENDPOINT = "http://ws.eatright.org/service/service.svc"  # HTTP only
+
 def _post_soap(action: str, envelope_xml: str) -> dict:
-    """
-    SOAP 1.1 POST with exact SOAPAction per ADA docs, endpoint fallback HTTP→HTTPS,
-    and explicit surfacing of SOAP Faults when the server responds with 500.
-    """
     import requests, xmltodict
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "Accept": "text/xml",
-        "SOAPAction": f"{API_NS}/{action}",  # e.g., http://eatright/membership/ValidateAccessKey
+        "SOAPAction": f"{API_NS}/{action}",
     }
-    last_err = None
-    for url in ENDPOINTS:
-        try:
-            r = requests.post(url, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
-            if r.status_code >= 400:
-                # Attempt to parse a SOAP Fault and surface its faultstring
-                try:
-                    doc = xmltodict.parse(r.text)
-                    # Common SOAP 1.1 fault location with 's' namespace
-                    fault = (doc.get("s:Envelope", {})
-                               .get("s:Body", {})
-                               .get("s:Fault"))
-                    if not fault:
-                        # Fallback without ns prefixes just in case
-                        fault = (doc.get("Envelope", {})
-                                   .get("Body", {})
-                                   .get("Fault"))
-                    if fault:
-                        faultstring = (
-                            fault.get("faultstring")
-                            or fault.get("faultcode")
-                            or "SOAP Fault"
-                        )
-                        raise RuntimeError(f"SOAP Fault from {url}: {faultstring}")
-                except Exception as inner:
-                    # If we can't parse a SOAP Fault, raise the HTTP status
-                    last_err = inner if isinstance(inner, RuntimeError) else None
-                # If we didn't raise above, raise for status now
-                r.raise_for_status()
+    r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
 
-            return xmltodict.parse(r.text)
+    if r.status_code >= 400:
+        try:
+            doc = xmltodict.parse(r.text)
+            fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
+                     or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
+            if fault:
+                faultstring = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
+                raise RuntimeError(f"SOAP Fault: {faultstring}")
+        except Exception:
+            pass
+        r.raise_for_status()
+
+    return xmltodict.parse(r.text)
+
 
         except Exception as e:
             last_err = e
