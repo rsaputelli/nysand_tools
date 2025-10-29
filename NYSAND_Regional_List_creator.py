@@ -409,6 +409,10 @@ if source == "Manual Upload":
                 blob = process_and_package(members_df, region_sheets)
             st.success("✅ Done! Download your ZIP below.")
             st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
+            
+        except Exception as e:
+            st.error(f"Manual upload failed: {e}")
+            
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
