@@ -87,34 +87,76 @@ API_NS  = "http://eatright/membership"
 ENDPOINT = "http://ws.eatright.org/service/service.svc"  # HTTP only
 
 def _post_soap(action: str, envelope_xml: str) -> dict:
-    """SOAP 1.1 POST over HTTP only, quote SOAPAction (WCF-friendly), and show body on 500."""
+    """
+    Robust SOAP POST over HTTP that tries several WCF-compatible action/header variants.
+    Stops at the first successful response and surfaces SOAP Faults clearly.
+    """
     import requests, xmltodict
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "Accept": "text/xml",
-        # WCF is picky; quoting the action helps: "http://eatright/membership/ValidateAccessKey"
-        "SOAPAction": f"\"{API_NS}/{action}\"",
-    }
 
-    r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
+    # Candidate SOAPAction values seen with WCF services
+    base = API_NS  # "http://eatright/membership"
+    action_candidates = [
+        f"\"{base}/{action}\"",             # "http://eatright/membership/ValidateAccessKey"
+        f"\"{base}/IService/{action}\"",    # "http://eatright/membership/IService/ValidateAccessKey"
+        f"{base}/{action}",                 # unquoted (some stacks accept this)
+        "",                                 # empty SOAPAction (occasionally accepted)
+    ]
 
-    if r.status_code >= 400:
-        # Try to parse a SOAP Fault; if not, surface raw body
-        try:
-            doc = xmltodict.parse(r.text)
-            fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
-                     or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
-            if fault:
-                faultstring = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
-                raise RuntimeError(f"SOAP Fault: {faultstring}")
-        except Exception:
-            # Not a parseable SOAP Fault — raise with response snippet so it shows in the UI
-            snippet = (r.text or "").strip()
-            if len(snippet) > 1200:
-                snippet = snippet[:1200] + " …(truncated)…"
-            raise RuntimeError(f"HTTP {r.status_code} from {ENDPOINT}. Body:\n{snippet}")
+    # Two header styles to try:
+    #  - SOAP 1.1: text/xml + SOAPAction header
+    #  - SOAP 1.2: application/soap+xml with action= param (no SOAPAction header)
+    header_styles = [
+        ("1.1", lambda sa: {
+            "Content-Type": "text/xml; charset=utf-8",
+            "Accept": "text/xml",
+            "SOAPAction": sa,
+        }),
+        ("1.2", lambda sa, b=base, a=action: {
+            # SOAP 1.2 uses action= in Content-Type (no separate SOAPAction header)
+            "Content-Type": f'application/soap+xml; charset=utf-8; action={sa or f\'"{b}/{a}"\'}',
+        "Accept": "application/soap+xml",
+            # no SOAPAction header in pure SOAP 1.2
+        }),
+    ]
 
-    return xmltodict.parse(r.text)
+    last_err = None
+    for ver, header_maker in header_styles:
+        for sa in action_candidates:
+            headers = header_maker(sa)
+            try:
+                r = requests.post(
+                    ENDPOINT,
+                    data=envelope_xml.encode("utf-8"),
+                    headers=headers,
+                    timeout=60
+                )
+
+                # If a SOAP Fault returns with 500, extract faultstring for clarity
+                if r.status_code >= 400:
+                    try:
+                        doc = xmltodict.parse(r.text)
+                        fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
+                                 or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
+                        if fault:
+                            fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
+                            raise RuntimeError(f"{ver} {('with SOAPAction ' + sa) if sa else '(no SOAPAction)'} → SOAP Fault: {fs}")
+                    except Exception:
+                        # Not a parseable SOAP fault; include raw snippet
+                        snippet = (r.text or "").strip()
+                        if len(snippet) > 1200:
+                            snippet = snippet[:1200] + " …(truncated)…"
+                        raise RuntimeError(f"{ver} {('with SOAPAction ' + sa) if sa else '(no SOAPAction)'} → HTTP {r.status_code}. Body:\n{snippet}")
+
+                # Success path: parse XML to dict and return
+                return xmltodict.parse(r.text)
+
+            except Exception as e:
+                last_err = e
+                continue
+
+    # If we exhausted all variants:
+    raise last_err or RuntimeError("All SOAP variants failed (action/header mismatch).")
+
 
 
 def _validate_access_key(access_key: str) -> bool:
