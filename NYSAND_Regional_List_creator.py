@@ -112,12 +112,16 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
             "SOAPAction": sa,
         }),
         ("1.2", lambda sa, b=base, a=action: {
-            # SOAP 1.2 uses action= in Content-Type (no separate SOAPAction header)
-            "Content-Type": f'application/soap+xml; charset=utf-8; action={sa or f\'"{b}/{a}"\'}',
-        "Accept": "application/soap+xml",
-            # no SOAPAction header in pure SOAP 1.2
+            # SOAP 1.2 uses the “action=” parameter in Content-Type instead of a SOAPAction header
+            "Content-Type": (
+                f'application/soap+xml; charset=utf-8; action="{b}/{a}"'
+                if not sa else
+                f'application/soap+xml; charset=utf-8; action={sa}'
+            ),
+            "Accept": "application/soap+xml",
         }),
     ]
+
 
     last_err = None
     for ver, header_maker in header_styles:
