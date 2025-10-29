@@ -1,4 +1,4 @@
-# NYSAND_Regional_List_creator_API.py
+# NYSAND_Regional_List_creator.py
 import streamlit as st
 import pandas as pd
 import zipfile
@@ -7,6 +7,21 @@ import re
 import os
 import requests, xmltodict
 from datetime import datetime
+
+# --- Region mapping loader (bundled first, uploader as fallback) ---
+DEFAULT_REGION_PATH = "assets/nysand_region_zips.xlsx"
+
+def load_region_mapping(region_xlsx_file=None):
+    """Return a dict of DataFrames keyed by sheet name, or None if not found."""
+    import pandas as pd, os
+    if region_xlsx_file is not None:
+        # User uploaded a file this session
+        return pd.read_excel(region_xlsx_file, sheet_name=None)
+    if os.path.exists(DEFAULT_REGION_PATH):
+        # Use the bundled repo file
+        return pd.read_excel(DEFAULT_REGION_PATH, sheet_name=None)
+    return None
+
 
 # =========================
 # Branding header (unchanged)
@@ -62,14 +77,26 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
+ENDPOINTS = [
+    "https://ws.eatright.org/service/service.svc",
+    "http://ws.eatright.org/service/service.svc",
+]
+
 def _post_soap(action: str, envelope_xml: str) -> dict:
+    """POST SOAP request with fallback between HTTPS and HTTP endpoints."""
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "SOAPAction": f"{API_NS}/{action}",
     }
-    r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
-    r.raise_for_status()
-    return xmltodict.parse(r.text)
+    last_err = None
+    for url in ENDPOINTS:
+        try:
+            r = requests.post(url, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
+            r.raise_for_status()
+            return xmltodict.parse(r.text)
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 def _validate_access_key(access_key: str) -> bool:
     body = f"""
@@ -163,16 +190,16 @@ def _clean_zip(zipcode):
     m = re.search(r"\b\d{5}\b", str(zipcode))
     return m.group(0) if m else None
 
-def process_and_package(members: pd.DataFrame, region_xlsx_bytes) -> bytes:
+def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
+    import zipfile, tempfile, os
     # Clean ZIP and build Zip_clean used for merge
     members = members.copy()
     members["Zip_clean"] = members["Zip"].apply(_clean_zip)
 
-    # Load zip region mapping (all sheets, first 3 cols → County, Zip, Region)
+    # Build one tall map from all sheets (first 3 columns: County, Zip, Region)
     zip_map_all = pd.DataFrame()
-    region_xls = pd.read_excel(region_xlsx_bytes, sheet_name=None)
-    for _, df in region_xls.items():
-        df = df.iloc[:, :3]
+    for _, df in region_sheets.items():
+        df = df.iloc[:, :3].copy()
         df.columns = ["County", "Zip", "Region"]
         df["Zip"] = df["Zip"].astype(str).str.zfill(5)
         zip_map_all = pd.concat([zip_map_all, df], ignore_index=True)
@@ -199,6 +226,7 @@ def process_and_package(members: pd.DataFrame, region_xlsx_bytes) -> bytes:
 
         return open(zip_path, "rb").read()
 
+
 # =========================
 # UI: Source selection
 # =========================
@@ -206,45 +234,68 @@ with st.sidebar:
     source = st.radio("Data source", ["Manual Upload", "EatRight SOAP API"], index=0)
     st.caption("Run API fetch first, then process into region files.")
 
-region_file = st.file_uploader("📄 Upload NYSAND Region Zipcodes Excel", type=["xls", "xlsx"], key="regionfile")
+# region_file = st.file_uploader("📄 Upload NYSAND Region Zipcodes Excel", type=["xls", "xlsx"], key="regionfile")
 
 if source == "Manual Upload":
     member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
-    if member_file and region_file:
-        with st.spinner("Processing files..."):
-            members_df = pd.read_csv(member_file)
-            if "Zip" not in members_df.columns:
-                st.error("Uploaded CSV must contain a 'Zip' column.")
-            else:
-                blob = process_and_package(members_df, region_file)
-                st.success("✅ Done! Download your ZIP below.")
-                st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
+    # uploader for mapping stays visible but is optional now:
+    region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile")
+
+    if member_file:
+        region_sheets = load_region_mapping(region_file)
+        if region_sheets is None:
+            st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
+        else:
+            with st.spinner("Processing files..."):
+                members_df = pd.read_csv(member_file)
+                if "Zip" not in members_df.columns:
+                    st.error("Uploaded CSV must contain a 'Zip' column.")
+                else:
+                    blob = process_and_package(members_df, region_sheets)
+                    st.success("✅ Done! Download your ZIP below.")
+                    st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
+
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
-    if st.button("🔄 Fetch members via API") and region_file:
+
+    # optional override uploader, but not required:
+    region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile_api")
+
+    fetch_clicked = st.button("🔄 Fetch members via API")
+    if fetch_clicked:
         try:
+            ak = st.secrets["EATR_ACCESS_KEY"]
+            gk = st.secrets["EATR_GROUP_KEY"]
+
             with st.spinner("Validating AccessKey…"):
-                ak = st.secrets["EATR_ACCESS_KEY"]
-                gk = st.secrets["EATR_GROUP_KEY"]
                 if not _validate_access_key(ak):
                     st.error("AccessKey invalid. Check Vendor Access in the portal.")
-                else:
-                    with st.spinner("Fetching members from EatRight API…"):
-                        api_df = fetch_members_via_api(ak, gk)
-                        st.success(f"Fetched {len(api_df):,} records.")
-                        st.dataframe(api_df.head(25))
+                    st.stop()
 
-                    with st.spinner("Creating region files…"):
-                        blob = process_and_package(api_df, region_file)
-                        today = datetime.now().strftime("%Y-%m-%d")
-                        st.success("✅ Done! Download your ZIP below.")
-                        st.download_button(
-                            "📥 Download All Files (ZIP)",
-                            blob,
-                            file_name=f"NYSAND_Member_Files_{today}.zip"
-                        )
+            with st.spinner("Fetching members from EatRight API…"):
+                api_df = fetch_members_via_api(ak, gk)
+            st.success(f"Fetched {len(api_df):,} records.")
+            st.dataframe(api_df.head(25))
+
+            region_sheets = load_region_mapping(region_file)
+            if region_sheets is None:
+                st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
+                st.stop()
+
+            with st.spinner("Creating region files…"):
+                blob = process_and_package(api_df, region_sheets)
+                today = datetime.now().strftime("%Y-%m-%d")
+                st.success("✅ Done! Download your ZIP below.")
+                st.download_button(
+                    "📥 Download All Files (ZIP)",
+                    blob,
+                    file_name=f"NYSAND_Member_Files_{today}.zip"
+                )
+
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
         except Exception as e:
             st.error(f"API fetch failed: {e}")
+            st.exception(e)
+
