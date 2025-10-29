@@ -159,56 +159,66 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
 def _post_soap(action: str, envelope_xml: str) -> dict:
     """
     SOAP 1.1 over HTTP only.
-    1) Try WSDL-declared soapAction(s), quoted.
-    2) Fall back to known WCF patterns, quoted (no SOAP 1.2).
-    Surfaces SOAP Faults or raw body on error.
+    Tries WSDL-declared soapAction(s) then common WCF variants, then empty SOAPAction.
+    On HTTP error, attempts to surface the SOAP Fault faultstring.
+    Always writes the last response body to /tmp/soap_response.xml for debugging.
     """
     base = API_NS  # "http://eatright/membership"
-    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # dedupe & preserve order
+    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # from WSDL, if any
     candidates += [
         f"{base}/{action}",
         f"{base}/IService/{action}",
         f"{base}/IWcfAdaMembership/{action}",
-        "",  # empty SOAPAction (some WCF allow this)
+        "",  # some WCF endpoints allow empty SOAPAction
     ]
 
+    last_body = ""
     errors = []
     for sa in candidates:
         headers = {
             "Content-Type": "text/xml; charset=utf-8",
             "Accept": "text/xml",
+            "SOAPAction": f"\"{sa}\"" if sa is not None else ""
         }
-        # SOAP 1.1 uses SOAPAction header; WCF prefers it quoted
-        if sa is not None:
-            headers["SOAPAction"] = f"\"{sa}\"" if sa else ""
-
         try:
             r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
+            last_body = r.text or ""
+            # save raw for inspection
+            try:
+                with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+                    f.write(last_body)
+            except Exception:
+                pass
+
             if r.status_code >= 400:
-                # Try to extract a SOAP Fault
+                # Try to parse a SOAP Fault
                 try:
-                    doc = xmltodict.parse(r.text)
+                    doc = xmltodict.parse(last_body)
                     fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
                              or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
                     if fault:
                         fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
-                        errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → Fault: {fs}")
+                        errors.append(f'SOAPAction={headers.get("SOAPAction","")} → Fault: {fs}')
                         continue
                 except Exception:
                     pass
-                snippet = (r.text or "").strip()
-                if len(snippet) > 1200:
-                    snippet = snippet[:1200] + " …(truncated)…"
-                errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → HTTP {r.status_code}: {snippet}")
+                errors.append(f'SOAPAction={headers.get("SOAPAction","")} → HTTP {r.status_code}')
                 continue
 
-            # Success — parse and return
-            return xmltodict.parse(r.text)
+            return xmltodict.parse(last_body)
 
         except Exception as e:
-            errors.append(f"1.1 SOAPAction={headers.get('SOAPAction','(none)')} → {e}")
+            errors.append(f'SOAPAction={headers.get("SOAPAction","")} → {e}')
 
-    raise RuntimeError(" / ".join(errors) or "All SOAP 1.1 variants failed.")
+    if last_body:
+        # preserve the last response for download/inspection
+        try:
+            with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+                f.write(last_body)
+        except Exception:
+            pass
+    raise RuntimeError(" ; ".join(errors) or "All SOAP 1.1 attempts failed.")
+
 
 
 def _validate_access_key(access_key: str) -> bool:
@@ -264,100 +274,75 @@ def _find_members_anywhere(obj):
     return out
 
 
-def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
-    """RetrieveGroupMembersWithCustomProperties → pandas DataFrame (robust)."""
+def fetch_members_via_api(access_key: str, group_key: str, *, include_custom_props: bool = True) -> pd.DataFrame:
+    """
+    Calls RetrieveGroupMembersWithCustomProperties (default) or RetrieveGroupMembers,
+    parses members robustly, expands CustomProperties when present, and normalizes Zip column.
+    """
+    method = "RetrieveGroupMembersWithCustomProperties" if include_custom_props else "RetrieveGroupMembers"
     body = f"""
-    <RetrieveGroupMembersWithCustomProperties xmlns="{API_NS}">
+    <{method} xmlns="{API_NS}">
       <groupKey>{group_key}</groupKey>
-    </RetrieveGroupMembersWithCustomProperties>
+    </{method}>
     """.strip()
     env = _soap_envelope(body, access_key=access_key)
 
-    # Get raw SOAP and save for debugging
-    r = requests.post(
-        ENDPOINT,
-        data=env.encode("utf-8"),
-        headers={
-            "Content-Type": "text/xml; charset=utf-8",
-            "Accept": "text/xml",
-            "SOAPAction": f"\"{API_NS}/RetrieveGroupMembersWithCustomProperties\"",
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    raw_xml = r.text
-    try:
-        with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
-            f.write(raw_xml)
-    except Exception:
-        pass  # best-effort
+    data = _post_soap(method, env)  # <- resilient SOAPAction handling, saves /tmp/soap_response.xml
 
-    # Parse xml → dict
-    data = xmltodict.parse(raw_xml)
+    # Navigate to the result node
+    body_node = (data.get("s:Envelope") or data.get("Envelope") or {}).get("s:Body") or data.get("Body") or {}
+    resp_key = f"{method}Response"
+    res_key  = f"{method}Result"
+    node = body_node.get(resp_key) or body_node.get(res_key) or body_node
+    if isinstance(node, dict) and res_key in node:
+        node = node[res_key]
 
-    # Navigate to the ...Result node if present, then search recursively
-    node = (data.get("s:Envelope") or data.get("Envelope") or {}).get("s:Body") or data.get("Body") or {}
-    node = (node.get("RetrieveGroupMembersWithCustomPropertiesResponse")
-            or node.get("RetrieveGroupMembersWithCustomPropertiesResult")
-            or node)
-
-    # In some shapes, the response puts Result under the Response object:
-    if isinstance(node, dict) and "RetrieveGroupMembersWithCustomPropertiesResult" in node:
-        node = node["RetrieveGroupMembersWithCustomPropertiesResult"]
-
-    # Try our robust recursive finder
+    # Robust member discovery
     rows = _find_members_anywhere(node)
 
-    # As a fallback, also look for explicit Members/Member nesting
-    if not rows:
+    # Fallback to explicit Members/Member nesting
+    if not rows and isinstance(node, dict):
         container = node
         for k in ("a:Members", "Members"):
-            if isinstance(container, dict) and k in container:
+            if k in container:
                 container = container[k]
-        members = container.get("a:Member") if isinstance(container, dict) else None
-        if not members and isinstance(container, dict):
-            members = container.get("Member")
-        if isinstance(members, dict):
-            rows = [members]
-        elif isinstance(members, list):
-            rows = members
+        members = None
+        if isinstance(container, dict):
+            members = container.get("a:Member") or container.get("Member")
+        rows = [members] if isinstance(members, dict) else (members or [])
 
-    # If still nothing, return empty DataFrame (the UI will show it clearly)
     if not rows:
         return pd.DataFrame()
 
-    # Strip namespace prefixes in keys
     def strip_ns(d):
         return {k.split(":", 1)[-1]: v for k, v in d.items()} if isinstance(d, dict) else {}
 
     cleaned = [strip_ns(r) for r in rows]
 
-    # Expand CustomProperties into columns, if present
-    def props_to_dict(v):
-        if not isinstance(v, dict):
-            return {}
-        items = v.get("a:CustomProperty") or v.get("CustomProperty") or []
-        if isinstance(items, dict):
-            items = [items]
-        out = {}
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            name = it.get("a:Name") or it.get("Name")
-            val  = it.get("a:Value") or it.get("Value")
-            if name:
-                out[str(name)] = val
-        return out
-
+    # Expand CustomProperties if available
     df = pd.DataFrame(cleaned)
     if "CustomProperties" in df.columns:
+        def props_to_dict(v):
+            if not isinstance(v, dict):
+                return {}
+            items = v.get("a:CustomProperty") or v.get("CustomProperty") or []
+            if isinstance(items, dict):
+                items = [items]
+            out = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                name = it.get("a:Name") or it.get("Name")
+                val  = it.get("a:Value") or it.get("Value")
+                if name:
+                    out[str(name)] = val
+            return out
         props = df["CustomProperties"].apply(props_to_dict).apply(pd.Series)
         df = pd.concat([df.drop(columns=["CustomProperties"]), props], axis=1)
 
-    # Create a Zip column from any plausible field (we’ll normalize later)
-    candidate_cols = [c for c in df.columns if c.lower() in ("zip", "postalcode", "postal_code", "zipcode")]
-    df["Zip"] = df[candidate_cols[0]] if candidate_cols else None
-
+    # Normalize a Zip column for the rest of the pipeline
+    candidates = [c for c in df.columns if c.lower() in ("zip", "zipcode", "postalcode", "postal_code")]
+    df["Zip"] = df[candidates[0]] if candidates else None
     return df
 
 
@@ -537,15 +522,33 @@ elif source == "EatRight SOAP API":
             ak = st.secrets["EATR_ACCESS_KEY"].strip()
             gk = st.secrets["EATR_GROUP_KEY"].strip()
 
+        use_custom = st.checkbox(
+            "Include custom properties (slower, richer)", value=True
+        )
+
+        with st.spinner("Fetching members from EatRight API…"):
+            api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
+            
+            
             with st.spinner("Validating AccessKey…"):
                 if not _validate_access_key(ak):
                     st.error("AccessKey invalid. Check Vendor Access in the portal.")
                     st.stop()
 
-            with st.spinner("Fetching members from EatRight API…"):
-                api_df = fetch_members_via_api(ak, gk)
             st.success(f"Fetched {len(api_df):,} records.")
             st.dataframe(api_df.head(25))
+
+        # Allow download of last SOAP response for debugging
+        try:
+            with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
+                raw_xml = f.read()
+            st.download_button(
+                "⬇️ Download last SOAP response (xml)",
+                raw_xml.encode("utf-8"),
+                file_name="soap_response.xml"
+            )
+        except Exception:
+            pass
 
             region_sheets = load_region_mapping(region_file)
             if region_sheets is None:
