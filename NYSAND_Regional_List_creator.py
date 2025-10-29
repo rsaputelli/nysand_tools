@@ -1,30 +1,31 @@
-# NYSAND_Regional_List_creator.py
-import streamlit as st
-import pandas as pd
+# NYSAND_Regional_List_creator.py  (drop-in repaired)
+import os
+import re
 import zipfile
 import tempfile
-import re
-import os
-import requests, xmltodict
 from datetime import datetime
 
-# --- Region mapping loader (bundled first, uploader as fallback) ---
+import pandas as pd
+import requests
+import streamlit as st
+import xmltodict
+
+# =========================
+# Region mapping loader (bundled first, uploader as fallback)
+# =========================
 DEFAULT_REGION_PATH = "assets/nysand_region_zips.xlsx"
 
 def load_region_mapping(region_xlsx_file=None):
     """Return a dict of DataFrames keyed by sheet name, or None if not found."""
-    import pandas as pd, os
     if region_xlsx_file is not None:
-        # User uploaded a file this session
         return pd.read_excel(region_xlsx_file, sheet_name=None)
     if os.path.exists(DEFAULT_REGION_PATH):
-        # Use the bundled repo file
         return pd.read_excel(DEFAULT_REGION_PATH, sheet_name=None)
     return None
 
 
 # =========================
-# Branding header (unchanged)
+# Branding header
 # =========================
 header_left, header_right = st.columns([3, 8])
 
@@ -59,15 +60,12 @@ Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**,
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
 
-# Per ADA docs, use HTTP only (their HTTPS certificate has expired)
+# Per ADA docs / observed cert problem — use HTTP only
 ENDPOINT = "http://ws.eatright.org/service/service.svc"
-
-# --- WSDL action map helpers ---
 WSDL_URL = "http://ws.eatright.org/service/service.svc?wsdl"
 
 def _wsdl_actions_map() -> dict:
     """Return {operationName: [soapAction, ...]} by parsing the WSDL (best-effort)."""
-    import requests, xmltodict
     try:
         r = requests.get(WSDL_URL, timeout=60)
         r.raise_for_status()
@@ -92,7 +90,7 @@ def _wsdl_actions_map() -> dict:
             soap_op = op.get("soap:operation")
             if isinstance(soap_op, dict) and "@soapAction" in soap_op:
                 actions.setdefault(name, []).append(soap_op["@soapAction"])
-            # SOAP 1.2
+            # SOAP 1.2 (we won't post 1.2, but collect actions just in case)
             soap12_op = op.get("soap12:operation")
             if isinstance(soap12_op, dict) and "@soapAction" in soap12_op:
                 actions.setdefault(name, []).append(soap12_op["@soapAction"])
@@ -103,15 +101,19 @@ _WSDL_ACTIONS = _wsdl_actions_map()
 def _wsdl_action_for(method: str) -> list[str]:
     return _WSDL_ACTIONS.get(method, [])
 
+
+# =========================
+# Shared processing helpers
+# =========================
 def _clean_zip(z):
-    import re
-    if z is None: return None
+    """Extract first 5 digits, return as 5-char string (drops +4 and non-digits)."""
+    if z is None or (isinstance(z, float) and pd.isna(z)):
+        return None
     s = str(z).strip()
-    if not s: return None
-    # Keep first 5 digits only (drop +4 or any non-digits)
-    m = re.search(r"\d{5}", s)
-    if not m: return None
-    return m.group(0)
+    if not s:
+        return None
+    m = re.search(r"\b(\d{5})\b", s)
+    return m.group(1) if m else None
 
 # Accept any plausible ZIP field name that could come from API or CSV/XLSX
 ZIP_CANDIDATE_COLS = [
@@ -131,13 +133,10 @@ def _ensure_member_zip_column(members_df: pd.DataFrame) -> str | None:
             if z.notna().any():
                 members_df["Zip_clean"] = z.astype(str).str.zfill(5)
                 return c
-    # No usable ZIP found; still create the column so downstream code runs
-    members_df["Zip_clean"] = None
+    members_df["Zip_clean"] = None  # still create column so downstream code runs
     return None
 
 
-
-# --- Keep this header builder exactly as is ---
 def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
     header = (
         f"""
@@ -156,6 +155,7 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
+
 def _post_soap(action: str, envelope_xml: str) -> dict:
     """
     SOAP 1.1 over HTTP only.
@@ -163,14 +163,8 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
     2) Fall back to known WCF patterns, quoted (no SOAP 1.2).
     Surfaces SOAP Faults or raw body on error.
     """
-    import requests, xmltodict
-
     base = API_NS  # "http://eatright/membership"
-
-    # Prioritize WSDL-declared actions (if any)
-    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # dedupe, preserve order
-
-    # Fallback patterns commonly seen in WCF
+    candidates = list(dict.fromkeys(_wsdl_action_for(action)))  # dedupe & preserve order
     candidates += [
         f"{base}/{action}",
         f"{base}/IService/{action}",
@@ -228,10 +222,10 @@ def _validate_access_key(access_key: str) -> bool:
     data = _post_soap("ValidateAccessKey", env)
     try:
         result = data["s:Envelope"]["s:Body"]["ValidateAccessKeyResponse"]["ValidateAccessKeyResult"]
-        # Some stacks use 'a:Success'; keep a fallback for 'Success'
         return str(result.get("a:Success", result.get("Success", "false"))).lower() == "true"
     except Exception:
         return False
+
 
 def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
     """RetrieveGroupMembersWithCustomProperties → pandas DataFrame"""
@@ -240,7 +234,6 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
       <groupKey>{group_key}</groupKey>
     </RetrieveGroupMembersWithCustomProperties>
     """.strip()
-    # For all other methods, include the AccessKey header
     env = _soap_envelope(body, access_key=access_key)
     data = _post_soap("RetrieveGroupMembersWithCustomProperties", env)
 
@@ -248,7 +241,6 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
 
     # Find list of members defensively
     def _to_rows(obj):
-        # common shapes: obj["a:Members"]["a:Member"] or already a list
         if isinstance(obj, dict):
             for k in ("a:Members", "Members"):
                 if k in obj:
@@ -293,45 +285,18 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
         props = df["CustomProperties"].apply(props_to_dict).apply(pd.Series)
         df = pd.concat([df.drop(columns=["CustomProperties"]), props], axis=1)
 
-    # Normalize: create a 'Zip' column that matches your current pipeline
+    # Normalize: create a 'Zip' column that matches pipeline (we will re-clean later)
     candidate_cols = [c for c in df.columns if c.lower() in ("zip", "postalcode", "postal_code", "zipcode")]
-    if candidate_cols:
-        df["Zip"] = df[candidate_cols[0]]
-    else:
-        # If no postal field exists, create empty (keeps pipeline from breaking)
-        df["Zip"] = None
+    df["Zip"] = df[candidate_cols[0]] if candidate_cols else None
 
     return df
 
 
 # =========================
-# Shared processing
+# Core processing
 # =========================
-def _clean_zip(zipcode):
-    if pd.isna(zipcode):
-        return None
-    m = re.search(r"\b\d{5}\b", str(zipcode))
-    return m.group(0) if m else None
-    
-# 1) Normalize member ZIPs from any known column name
-source_col = _ensure_member_zip_column(members)
-if source_col is None:
-    # No usable ZIP column found — everything will be unmatched
-    pass  # We still proceed so you get a clean Unmatched file
-
-# 2) Normalize region ZIPs to 5-digit strings (handles text/numeric)
-zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
-zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
-zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
-zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
-
-# 3) Merge
-merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
-    
-
 def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
-    import zipfile, tempfile, os
-
+    """Return a bytes ZIP containing per-region workbooks + unmatched workbook."""
     # --- Normalize member ZIPs from any known column name ---
     members = members.copy()
     source_col = _ensure_member_zip_column(members)  # may be None if no ZIP-like column is present
@@ -347,16 +312,14 @@ def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
     zip_map_all["Zip"] = zip_map_all["Zip"].map(_clean_zip)
     zip_map_all = zip_map_all[zip_map_all["Zip"].notna()].copy()
     zip_map_all["Zip"] = zip_map_all["Zip"].astype(str).str.zfill(5)
-    # If the same ZIP appears on multiple sheets, keep the first occurrence
     zip_map_all = zip_map_all.drop_duplicates(subset=["Zip"], keep="first")
 
     # --- Merge + group ---
     merged = pd.merge(members, zip_map_all, left_on="Zip_clean", right_on="Zip", how="left")
     grouped = merged[merged["Region"].notna()].groupby("Region")
 
-    # (Optional) quick match stats in Streamlit UI
+    # UI: quick match stats
     try:
-        import streamlit as st
         matched = merged["Region"].notna().sum()
         total = len(merged)
         st.info(f"Matched {matched} of {total} members to regions"
@@ -383,7 +346,6 @@ def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
         return open(zip_path, "rb").read()
 
 
-
 # =========================
 # UI: Source selection
 # =========================
@@ -393,7 +355,6 @@ with st.sidebar:
 
 if source == "Manual Upload":
     member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
-    # Optional override of bundled mapping:
     region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile")
 
     if member_file:
@@ -403,21 +364,16 @@ if source == "Manual Upload":
         else:
             with st.spinner("Processing files..."):
                 members_df = pd.read_csv(member_file)
-                if "Zip" not in members_df.columns:
-                    st.error("Uploaded CSV must contain a 'Zip' column.")
-                else:
-                    blob = process_and_package(members_df, region_sheets)
-                    st.success("✅ Done! Download your ZIP below.")
-                    st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
+                # Do NOT enforce a literal 'Zip' column; pipeline will detect/clean
+                blob = process_and_package(members_df, region_sheets)
+                st.success("✅ Done! Download your ZIP below.")
+                st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
-
-    # Optional override of bundled mapping:
     region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile_api")
 
-    fetch_clicked = st.button("🔄 Fetch members via API")
-    if fetch_clicked:
+    if st.button("🔄 Fetch members via API"):
         try:
             ak = st.secrets["EATR_ACCESS_KEY"].strip()
             gk = st.secrets["EATR_GROUP_KEY"].strip()
