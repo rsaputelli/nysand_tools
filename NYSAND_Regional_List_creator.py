@@ -52,12 +52,18 @@ Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**,
 - Download everything in a single ZIP
 """)
 
+
 # =========================
 # SOAP API helpers
 # =========================
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
-ENDPOINT = "https://ws.eatright.org/service/service.svc"
+
+# Per ADA docs the public service endpoint is HTTP; we try HTTP first, then HTTPS.
+ENDPOINTS = [
+    "http://ws.eatright.org/service/service.svc",
+    "https://ws.eatright.org/service/service.svc",
+]
 
 def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
     header = (
@@ -77,25 +83,53 @@ def _soap_envelope(body_xml: str, *, access_key: str | None) -> str:
   </s:Body>
 </s:Envelope>""".strip()
 
-ENDPOINTS = [
-    "https://ws.eatright.org/service/service.svc",
-    "http://ws.eatright.org/service/service.svc",
-]
-
 def _post_soap(action: str, envelope_xml: str) -> dict:
-    """POST SOAP request with fallback between HTTPS and HTTP endpoints."""
+    """
+    SOAP 1.1 POST with exact SOAPAction per ADA docs, endpoint fallback HTTP→HTTPS,
+    and explicit surfacing of SOAP Faults when the server responds with 500.
+    """
+    import requests, xmltodict
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": f"{API_NS}/{action}",
+        "Accept": "text/xml",
+        "SOAPAction": f"{API_NS}/{action}",  # e.g., http://eatright/membership/ValidateAccessKey
     }
     last_err = None
     for url in ENDPOINTS:
         try:
             r = requests.post(url, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Attempt to parse a SOAP Fault and surface its faultstring
+                try:
+                    doc = xmltodict.parse(r.text)
+                    # Common SOAP 1.1 fault location with 's' namespace
+                    fault = (doc.get("s:Envelope", {})
+                               .get("s:Body", {})
+                               .get("s:Fault"))
+                    if not fault:
+                        # Fallback without ns prefixes just in case
+                        fault = (doc.get("Envelope", {})
+                                   .get("Body", {})
+                                   .get("Fault"))
+                    if fault:
+                        faultstring = (
+                            fault.get("faultstring")
+                            or fault.get("faultcode")
+                            or "SOAP Fault"
+                        )
+                        raise RuntimeError(f"SOAP Fault from {url}: {faultstring}")
+                except Exception as inner:
+                    # If we can't parse a SOAP Fault, raise the HTTP status
+                    last_err = inner if isinstance(inner, RuntimeError) else None
+                # If we didn't raise above, raise for status now
+                r.raise_for_status()
+
             return xmltodict.parse(r.text)
+
         except Exception as e:
             last_err = e
+            continue
+    # If both endpoints failed:
     raise last_err
 
 def _validate_access_key(access_key: str) -> bool:
@@ -104,11 +138,13 @@ def _validate_access_key(access_key: str) -> bool:
       <key>{access_key}</key>
     </ValidateAccessKey>
     """.strip()
+    # IMPORTANT: per docs, do NOT send the AccessKey header for ValidateAccessKey
     env = _soap_envelope(body, access_key=None)
     data = _post_soap("ValidateAccessKey", env)
     try:
         result = data["s:Envelope"]["s:Body"]["ValidateAccessKeyResponse"]["ValidateAccessKeyResult"]
-        return str(result.get("a:Success", "false")).lower() == "true"
+        # Some stacks use 'a:Success'; keep a fallback for 'Success'
+        return str(result.get("a:Success", result.get("Success", "false"))).lower() == "true"
     except Exception:
         return False
 
@@ -119,6 +155,7 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
       <groupKey>{group_key}</groupKey>
     </RetrieveGroupMembersWithCustomProperties>
     """.strip()
+    # For all other methods, include the AccessKey header
     env = _soap_envelope(body, access_key=access_key)
     data = _post_soap("RetrieveGroupMembersWithCustomProperties", env)
 
@@ -181,6 +218,7 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
 
     return df
 
+
 # =========================
 # Shared processing
 # =========================
@@ -234,11 +272,9 @@ with st.sidebar:
     source = st.radio("Data source", ["Manual Upload", "EatRight SOAP API"], index=0)
     st.caption("Run API fetch first, then process into region files.")
 
-# region_file = st.file_uploader("📄 Upload NYSAND Region Zipcodes Excel", type=["xls", "xlsx"], key="regionfile")
-
 if source == "Manual Upload":
     member_file = st.file_uploader("📄 Upload Member Export CSV", type="csv")
-    # uploader for mapping stays visible but is optional now:
+    # Optional override of bundled mapping:
     region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile")
 
     if member_file:
@@ -255,11 +291,10 @@ if source == "Manual Upload":
                     st.success("✅ Done! Download your ZIP below.")
                     st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
 
-
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
 
-    # optional override uploader, but not required:
+    # Optional override of bundled mapping:
     region_file = st.file_uploader("📄 (Optional) Upload NYSAND Region Zipcodes Excel (overrides bundled)", type=["xls", "xlsx"], key="regionfile_api")
 
     fetch_clicked = st.button("🔄 Fetch members via API")
@@ -298,4 +333,3 @@ elif source == "EatRight SOAP API":
         except Exception as e:
             st.error(f"API fetch failed: {e}")
             st.exception(e)
-
