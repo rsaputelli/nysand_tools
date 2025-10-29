@@ -227,43 +227,112 @@ def _validate_access_key(access_key: str) -> bool:
         return False
 
 
+def _find_members_anywhere(obj):
+    """
+    Recursively search a parsed xmltodict structure for a list/dict of members.
+    We look for arrays whose items look like person records (have RecordNumber/LoginName/PostalCode/etc.).
+    Returns a list[dict] (possibly empty).
+    """
+    CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}
+    out = []
+
+    def is_member_dict(d):
+        if not isinstance(d, dict):
+            return False
+        # strip namespace prefixes for key comparison
+        keys = {k.split(":", 1)[-1] for k in d.keys()}
+        return len(CANDIDATE_KEYS.intersection(keys)) >= 2  # at least two familiar fields
+
+    def walk(x):
+        nonlocal out
+        if isinstance(x, list):
+            # if this list already looks like members, keep items that are dict-like
+            if x and all(isinstance(i, dict) for i in x) and any(is_member_dict(i) for i in x):
+                out.extend([i for i in x if isinstance(i, dict)])
+                return
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            # if this dict itself looks like a member, capture it
+            if is_member_dict(x):
+                out.append(x)
+                return
+            for v in x.values():
+                walk(v)
+
+    walk(obj)
+    return out
+
+
 def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
-    """RetrieveGroupMembersWithCustomProperties → pandas DataFrame"""
+    """RetrieveGroupMembersWithCustomProperties → pandas DataFrame (robust)."""
     body = f"""
     <RetrieveGroupMembersWithCustomProperties xmlns="{API_NS}">
       <groupKey>{group_key}</groupKey>
     </RetrieveGroupMembersWithCustomProperties>
     """.strip()
     env = _soap_envelope(body, access_key=access_key)
-    data = _post_soap("RetrieveGroupMembersWithCustomProperties", env)
 
-    node = data["s:Envelope"]["s:Body"]["RetrieveGroupMembersWithCustomPropertiesResponse"]["RetrieveGroupMembersWithCustomPropertiesResult"]
+    # Get raw SOAP and save for debugging
+    r = requests.post(
+        ENDPOINT,
+        data=env.encode("utf-8"),
+        headers={
+            "Content-Type": "text/xml; charset=utf-8",
+            "Accept": "text/xml",
+            "SOAPAction": f"\"{API_NS}/RetrieveGroupMembersWithCustomProperties\"",
+        },
+        timeout=60,
+    )
+    r.raise_for_status()
+    raw_xml = r.text
+    try:
+        with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+            f.write(raw_xml)
+    except Exception:
+        pass  # best-effort
 
-    # Find list of members defensively
-    def _to_rows(obj):
-        if isinstance(obj, dict):
-            for k in ("a:Members", "Members"):
-                if k in obj:
-                    obj = obj[k]
-                    break
-            for k in ("a:Member", "Member"):
-                if isinstance(obj, dict) and k in obj:
-                    obj = obj[k]
-                    break
-        if isinstance(obj, list):
-            return obj
-        if isinstance(obj, dict):
-            return [obj]
-        return []
+    # Parse xml → dict
+    data = xmltodict.parse(raw_xml)
 
-    rows = _to_rows(node)
+    # Navigate to the ...Result node if present, then search recursively
+    node = (data.get("s:Envelope") or data.get("Envelope") or {}).get("s:Body") or data.get("Body") or {}
+    node = (node.get("RetrieveGroupMembersWithCustomPropertiesResponse")
+            or node.get("RetrieveGroupMembersWithCustomPropertiesResult")
+            or node)
 
+    # In some shapes, the response puts Result under the Response object:
+    if isinstance(node, dict) and "RetrieveGroupMembersWithCustomPropertiesResult" in node:
+        node = node["RetrieveGroupMembersWithCustomPropertiesResult"]
+
+    # Try our robust recursive finder
+    rows = _find_members_anywhere(node)
+
+    # As a fallback, also look for explicit Members/Member nesting
+    if not rows:
+        container = node
+        for k in ("a:Members", "Members"):
+            if isinstance(container, dict) and k in container:
+                container = container[k]
+        members = container.get("a:Member") if isinstance(container, dict) else None
+        if not members and isinstance(container, dict):
+            members = container.get("Member")
+        if isinstance(members, dict):
+            rows = [members]
+        elif isinstance(members, list):
+            rows = members
+
+    # If still nothing, return empty DataFrame (the UI will show it clearly)
+    if not rows:
+        return pd.DataFrame()
+
+    # Strip namespace prefixes in keys
     def strip_ns(d):
         return {k.split(":", 1)[-1]: v for k, v in d.items()} if isinstance(d, dict) else {}
 
     cleaned = [strip_ns(r) for r in rows]
 
-    # Expand CustomProperties → columns
+    # Expand CustomProperties into columns, if present
     def props_to_dict(v):
         if not isinstance(v, dict):
             return {}
@@ -285,11 +354,12 @@ def fetch_members_via_api(access_key: str, group_key: str) -> pd.DataFrame:
         props = df["CustomProperties"].apply(props_to_dict).apply(pd.Series)
         df = pd.concat([df.drop(columns=["CustomProperties"]), props], axis=1)
 
-    # Normalize: create a 'Zip' column that matches pipeline (we will re-clean later)
+    # Create a Zip column from any plausible field (we’ll normalize later)
     candidate_cols = [c for c in df.columns if c.lower() in ("zip", "postalcode", "postal_code", "zipcode")]
     df["Zip"] = df[candidate_cols[0]] if candidate_cols else None
 
     return df
+
 
 
 def _debug_merge_preview(members_df: pd.DataFrame, region_sheets: dict):
