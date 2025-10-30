@@ -11,22 +11,39 @@ import xmltodict
 # ---------- Config & helpers ----------
 DEFAULT_REGION_ASSET = "assets/nysand_region_zips.xlsx"
 
-# add this helper (anywhere above fetch_members)
 def force_http(url: str | None) -> str:
     if not url:
         return "http://reports.eatright.org/MemberServices/MemberService.asmx"
     u = url.strip()
     p = urlparse(u)
-    # Coerce https→http while preserving host/path/query
     if p.scheme.lower() == "https":
         p = p._replace(scheme="http")
         u = urlunparse(p)
-    # Normalize known ADA endpoints explicitly
+    # Normalize known ADA endpoints to HTTP explicitly
     if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
         return "http://reports.eatright.org/MemberServices/MemberService.asmx"
     if "ws.eatright.org/service/service.svc" in u:
         return "http://ws.eatright.org/service/service.svc"
     return u
+
+def _post_http_no_https_redirect(url: str, data: bytes, headers: dict, timeout: int = 90) -> requests.Response:
+    """
+    POST without following redirects. If server tries to redirect to HTTPS, rewrite back to HTTP and retry once.
+    """
+    # 1) First attempt: no redirects
+    r = requests.post(url, data=data, headers=headers, timeout=timeout, allow_redirects=False)
+    if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+        loc = r.headers.get("Location", "")
+        if loc:
+            p = urlparse(loc)
+            # If it’s redirecting us to HTTPS, force back to HTTP and retry once
+            if p.scheme.lower() == "https":
+                p = p._replace(scheme="http")
+                http_loc = urlunparse(p)
+                r2 = requests.post(http_loc, data=data, headers=headers, timeout=timeout, allow_redirects=False)
+                return r2
+    return r
+
 
 def _clean_zip(s):
     return re.sub(r"\D+", "", str(s or ""))[:5]
@@ -92,11 +109,20 @@ def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom
         "Content-Type": "text/xml; charset=utf-8",
         "SOAPAction": "http://eatright.org/GetMembers",
     }
-    body = soap_envelope(access_key, group_key, include_custom)
-    r = requests.post(endpoint, data=body.encode("utf-8"), headers=headers, timeout=90)
-    r.raise_for_status()
+    body = soap_envelope(access_key, group_key, include_custom).encode("utf-8")
 
-    parsed = xmltodict.parse(r.text)
+    # >>> use redirect-safe POST
+    resp = _post_http_no_https_redirect(endpoint, data=body, headers=headers, timeout=90)
+
+    # If still not OK, try one fallback endpoint before failing
+    if resp.status_code == 404 or resp.status_code in (301, 302, 303, 307, 308):
+        alt = "http://ws.eatright.org/service/service.svc"
+        if urlparse(endpoint).netloc != urlparse(alt).netloc:
+            print(f"[{datetime.utcnow().isoformat()}Z] Retrying on alternate endpoint host (http): {urlparse(alt).netloc}")
+            resp = _post_http_no_https_redirect(alt, data=body, headers=headers, timeout=90)
+
+    resp.raise_for_status()
+    parsed = xmltodict.parse(resp.text)
 
     # best-effort crawl to find member dicts
     out = []
