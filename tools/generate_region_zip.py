@@ -2,6 +2,7 @@
 # Headless NYSAND region ZIP generator for CI / schedulers
 import os, re, io, zipfile, tempfile, argparse, sys
 from datetime import datetime
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 import requests
@@ -116,6 +117,24 @@ def build_zip_blob(members_df: pd.DataFrame, region_sheets: dict) -> bytes:
             p = os.path.join(td, "debug_unmatched.csv"); merged[merged["Region"].isna()].to_csv(p, index=False); zf.write(p, arcname="debug/unmatched.csv")
         with open(zip_path, "rb") as f:
             return f.read()
+
+def force_http(url: str | None) -> str:
+    if not url:
+        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() == "https":
+        parsed = parsed._replace(scheme="http")
+        return urlunparse(parsed)
+    # normalize known ADA endpoints explicitly
+    u = url.strip()
+    if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
+        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
+    if "ws.eatright.org/service/service.svc" in u:
+        return "http://ws.eatright.org/service/service.svc"
+    return u
+
+# set endpoint with coercion to http
+endpoint = force_http(os.environ.get("EATR_ENDPOINT_URL"))
 
 # ---------- CLI ----------
 def main():
