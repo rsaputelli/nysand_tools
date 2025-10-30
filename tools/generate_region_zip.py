@@ -1,17 +1,21 @@
 # tools/generate_region_zip.py
 # Headless NYSAND region ZIP generator for CI / schedulers
-import os, re, io, zipfile, tempfile, argparse, sys
-from datetime import datetime
-from urllib.parse import urlparse, urlunparse
 
-import pandas as pd
+from urllib.parse import urlparse, urlunparse
+from datetime import datetime
+import argparse
 import requests
 import xmltodict
+import pandas as pd
+import re, io, zipfile, tempfile, sys, os
 
 # ---------- Config & helpers ----------
 DEFAULT_REGION_ASSET = "assets/nysand_region_zips.xlsx"
 
 def force_http(url: str | None) -> str:
+    """
+    Coerce any HTTPS endpoint to HTTP and normalize known ADA endpoints to HTTP.
+    """
     if not url:
         return "http://reports.eatright.org/MemberServices/MemberService.asmx"
     u = url.strip()
@@ -19,7 +23,6 @@ def force_http(url: str | None) -> str:
     if p.scheme.lower() == "https":
         p = p._replace(scheme="http")
         u = urlunparse(p)
-    # Normalize known ADA endpoints to HTTP explicitly
     if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
         return "http://reports.eatright.org/MemberServices/MemberService.asmx"
     if "ws.eatright.org/service/service.svc" in u:
@@ -28,22 +31,20 @@ def force_http(url: str | None) -> str:
 
 def _post_http_no_https_redirect(url: str, data: bytes, headers: dict, timeout: int = 90) -> requests.Response:
     """
-    POST without following redirects. If server tries to redirect to HTTPS, rewrite back to HTTP and retry once.
+    POST without following redirects. If server tries to redirect to HTTPS,
+    rewrite back to HTTP and retry once.
     """
-    # 1) First attempt: no redirects
     r = requests.post(url, data=data, headers=headers, timeout=timeout, allow_redirects=False)
     if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
         loc = r.headers.get("Location", "")
         if loc:
             p = urlparse(loc)
-            # If it’s redirecting us to HTTPS, force back to HTTP and retry once
             if p.scheme.lower() == "https":
                 p = p._replace(scheme="http")
                 http_loc = urlunparse(p)
                 r2 = requests.post(http_loc, data=data, headers=headers, timeout=timeout, allow_redirects=False)
                 return r2
     return r
-
 
 def _clean_zip(s):
     return re.sub(r"\D+", "", str(s or ""))[:5]
@@ -74,7 +75,6 @@ def load_region_mapping(region_xlsx_path: str | None) -> dict | None:
 def region_concat_map(sheets: dict) -> pd.DataFrame:
     acc = []
     for _, df in sheets.items():
-        # normalize columns to Zip/County/Region best-effort
         cols = {c.lower(): c for c in df.columns}
         zip_col = cols.get("zip") or cols.get("zipcode") or list(df.columns)[0]
         out = pd.DataFrame()
@@ -86,13 +86,17 @@ def region_concat_map(sheets: dict) -> pd.DataFrame:
     m = pd.concat(acc, ignore_index=True)
     return m.drop_duplicates(subset=["Zip"]).reset_index(drop=True)
 
-def soap_envelope(access_key: str, group_key: str, include_custom=True) -> str:
+def soap_envelope_xmlns(access_key: str, group_key: str, include_custom=True, xmlns="http://eatright/membership") -> str:
+    """
+    Build SOAP 1.1 envelope with a selectable XML namespace for the GetMembers op.
+    Some hosts expect http://eatright/membership, others http://eatright.org/.
+    """
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema"
                xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body>
-    <GetMembers xmlns="http://eatright.org/">
+    <GetMembers xmlns="{xmlns}">
       <AccessKey>{access_key}</AccessKey>
       <GroupKey>{group_key}</GroupKey>
       <IncludeCustomProperties>{'true' if include_custom else 'false'}</IncludeCustomProperties>
@@ -101,25 +105,45 @@ def soap_envelope(access_key: str, group_key: str, include_custom=True) -> str:
 </soap:Envelope>
 """
 
-# modify fetch_members to force HTTP and log the scheme
+def _try_post(endpoint: str, access_key: str, group_key: str, include_custom: bool) -> requests.Response:
+    """
+    Try both SOAPAction/namespace combos against the given endpoint:
+      1) SOAPAction: http://eatright/membership/GetMembers  (xmlns=http://eatright/membership)
+      2) SOAPAction: http://eatright.org/GetMembers        (xmlns=http://eatright.org/)
+    Return the first 2xx response; otherwise return the last response for error handling.
+    """
+    combos = [
+        ("http://eatright/membership/GetMembers", "http://eatright/membership"),
+        ("http://eatright.org/GetMembers",        "http://eatright.org/"),
+    ]
+    last = None
+    for action, ns in combos:
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPAction": action,
+        }
+        body = soap_envelope_xmlns(access_key, group_key, include_custom, xmlns=ns).encode("utf-8")
+        resp = _post_http_no_https_redirect(endpoint, data=body, headers=headers, timeout=90)
+        print(f"[{datetime.utcnow().isoformat()}Z] Tried SOAPAction={action} ns={ns} → status={resp.status_code}")
+        last = resp
+        if 200 <= resp.status_code < 300:
+            return resp
+    return last
+
 def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom=True) -> pd.DataFrame:
     endpoint = force_http(endpoint)
     print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme={urlparse(endpoint).scheme}")
-    headers = {
-        "Content-Type": "text/xml; charset=utf-8",
-        "SOAPAction": "http://eatright.org/GetMembers",
-    }
-    body = soap_envelope(access_key, group_key, include_custom).encode("utf-8")
 
-    # >>> use redirect-safe POST
-    resp = _post_http_no_https_redirect(endpoint, data=body, headers=headers, timeout=90)
+    # 1) Try given endpoint with both SOAPAction variants
+    resp = _try_post(endpoint, access_key, group_key, include_custom)
 
-    # If still not OK, try one fallback endpoint before failing
-    if resp.status_code == 404 or resp.status_code in (301, 302, 303, 307, 308):
-        alt = "http://ws.eatright.org/service/service.svc"
-        if urlparse(endpoint).netloc != urlparse(alt).netloc:
-            print(f"[{datetime.utcnow().isoformat()}Z] Retrying on alternate endpoint host (http): {urlparse(alt).netloc}")
-            resp = _post_http_no_https_redirect(alt, data=body, headers=headers, timeout=90)
+    # 2) If not OK, try alternate host with both variants (HTTP only)
+    if not (200 <= resp.status_code < 300):
+        alt = "http://ws.eatright.org/service/service.svc" \
+              if "reports.eatright.org" in endpoint else \
+              "http://reports.eatright.org/MemberServices/MemberService.asmx"
+        print(f"[{datetime.utcnow().isoformat()}Z] Falling back to alternate host: {alt}")
+        resp = _try_post(alt, access_key, group_key, include_custom)
 
     resp.raise_for_status()
     parsed = xmltodict.parse(resp.text)
@@ -138,7 +162,6 @@ def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom
             for v in n: walk(v)
     walk(parsed)
     if not out:
-        # fallback: whole document
         out = [parsed]
     df = pd.json_normalize(out, max_level=3).drop_duplicates().reset_index(drop=True)
     return ensure_zip_col(df)
@@ -164,24 +187,6 @@ def build_zip_blob(members_df: pd.DataFrame, region_sheets: dict) -> bytes:
             p = os.path.join(td, "debug_unmatched.csv"); merged[merged["Region"].isna()].to_csv(p, index=False); zf.write(p, arcname="debug/unmatched.csv")
         with open(zip_path, "rb") as f:
             return f.read()
-
-def force_http(url: str | None) -> str:
-    if not url:
-        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
-    parsed = urlparse(url.strip())
-    if parsed.scheme.lower() == "https":
-        parsed = parsed._replace(scheme="http")
-        return urlunparse(parsed)
-    # normalize known ADA endpoints explicitly
-    u = url.strip()
-    if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
-        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
-    if "ws.eatright.org/service/service.svc" in u:
-        return "http://ws.eatright.org/service/service.svc"
-    return u
-
-# set endpoint with coercion to http
-endpoint = force_http(os.environ.get("EATR_ENDPOINT_URL"))
 
 # ---------- CLI ----------
 def main():
