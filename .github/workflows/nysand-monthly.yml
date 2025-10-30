@@ -40,9 +40,11 @@ jobs:
         env:
           EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
           EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
-          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+          # TEMP: hardcode HTTP to prove the job can pass
+          EATR_ENDPOINT_URL: http://reports.eatright.org/MemberServices/MemberService.asmx
         run: |
           python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
