@@ -75,14 +75,28 @@ def _soap_envelope(body_xml: str, access_key: str | None) -> str:
 </s:Envelope>""".strip()
 
 def _post_soap(action: str, envelope_xml: str) -> dict:
-    base = API_NS
+    base = API_NS  # "http://eatright/membership"
+    ORG = "http://eatright.org"  # add org namespace base
+
+    # 1) WSDL-probed actions (if we found them)
     candidates = list(dict.fromkeys(_WSDL_ACTIONS.get(action, [])))
+
+    # 2) Membership-namespace variants (existing ones)
     candidates += [
         f"{base}/{action}",
         f"{base}/IService/{action}",
         f"{base}/IWcfAdaMembership/{action}",
-        "",
+        "",  # sometimes empty SOAPAction works
     ]
+
+    # 3) ORG-namespace variants (NEW)
+    candidates += [
+        f"{ORG}/{action}",
+        f"{ORG}/MemberService/{action}",
+        f"{ORG}/IService/{action}",
+        f"{ORG}/IWcfAdaMembership/{action}",
+    ]
+
     last_body = ""
     errors = []
     for sa in candidates:
@@ -94,14 +108,13 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
         try:
             r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
             last_body = r.text or ""
-            # save last response for CI artifact
             try:
                 with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
                     f.write(last_body)
             except Exception:
                 pass
             if r.status_code >= 400:
-                # parse Fault if present
+                # parse SOAP Faults if present
                 try:
                     doc = xmltodict.parse(last_body)
                     fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
@@ -117,13 +130,16 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
             return xmltodict.parse(last_body)
         except Exception as e:
             errors.append(f"SOAPAction={headers.get('SOAPAction','')} → {e}")
+
     if last_body:
         try:
             with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
                 f.write(last_body)
         except Exception:
             pass
+
     raise RuntimeError(" ; ".join(errors) or "All SOAP attempts failed")
+
 
 def _find_members_anywhere(obj):
     CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}

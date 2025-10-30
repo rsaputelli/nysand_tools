@@ -10,6 +10,15 @@ import requests
 import streamlit as st
 import xmltodict
 
+import streamlit as st
+from datetime import datetime
+# (other imports...)
+
+# ---- persistence slots (added for download link persistence) ----
+st.session_state.setdefault("region_blob", None)
+st.session_state.setdefault("region_blob_ts", None)  # optional timestamp label
+
+
 # =========================
 # Region mapping loader (bundled first, uploader as fallback)
 # =========================
@@ -505,9 +514,18 @@ if source == "Manual Upload":
 
             # --- Create outputs ---
             with st.spinner("Processing files..."):
-                blob = process_and_package(members_df, region_sheets)
+            # Persist ZIP so it stays after reruns
+            st.session_state["region_blob"] = blob
+            st.session_state["region_blob_ts"] = datetime.now().strftime("%Y-%m-%d")
+
             st.success("✅ Done! Download your ZIP below.")
-            st.download_button("📥 Download All Files (ZIP)", blob, file_name="NYSAND_Member_Files.zip")
+            st.download_button(
+                "📥 Download All Files (ZIP)",
+                blob,
+                file_name="NYSAND_Member_Files.zip",
+                key="dl_region_zip_manual"
+            )
+
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
@@ -686,12 +704,18 @@ elif source == "EatRight SOAP API":
             with st.spinner("Creating region files…"):
                 blob = process_and_package(api_df, region_sheets)
             today = datetime.now().strftime("%Y-%m-%d")
+            # Persist ZIP so it stays after reruns
+            st.session_state["region_blob"] = blob
+            st.session_state["region_blob_ts"] = today
+
             st.success("✅ Done! Download your ZIP below.")
             st.download_button(
                 "📥 Download All Files (ZIP)",
                 blob,
                 file_name=f"NYSAND_Member_Files_{today}.zip",
+                key="dl_region_zip_api"
             )
+
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
         except Exception as e:

@@ -51,3 +51,11 @@ jobs:
         with:
           name: NYSAND_Member_Files
           path: out/NYSAND_Member_Files.zip
+
+      - name: Upload SOAP diagnostic (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soap_response_xml
+          path: /tmp/soap_response.xml
+          if-no-files-found: ignore
