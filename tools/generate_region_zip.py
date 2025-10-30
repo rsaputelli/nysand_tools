@@ -1,230 +1,282 @@
 # tools/generate_region_zip.py
-# Headless NYSAND region ZIP generator for CI / schedulers
-
-from urllib.parse import urlparse, urlunparse
+import os, sys, re, zipfile, tempfile, base64, json
 from datetime import datetime
-import argparse
+import pandas as pd
 import requests
 import xmltodict
-import pandas as pd
-import re, io, zipfile, tempfile, sys, os
 
-# ---------- Config & helpers ----------
-DEFAULT_REGION_ASSET = "assets/nysand_region_zips.xlsx"
+# ---------- Config / Inputs ----------
+OUT_PATH = None
+for i, a in enumerate(sys.argv):
+    if a == "--out" and i + 1 < len(sys.argv):
+        OUT_PATH = sys.argv[i + 1]
+if not OUT_PATH:
+    print("Usage: python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip", file=sys.stderr)
+    sys.exit(2)
 
-def force_http(url: str | None) -> str:
-    """
-    Coerce any HTTPS endpoint to HTTP and normalize known ADA endpoints to HTTP.
-    """
-    if not url:
-        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
-    u = url.strip()
-    p = urlparse(u)
-    if p.scheme.lower() == "https":
-        p = p._replace(scheme="http")
-        u = urlunparse(p)
-    if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
-        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
-    if "ws.eatright.org/service/service.svc" in u:
-        return "http://ws.eatright.org/service/service.svc"
-    return u
+ACCESS_KEY   = os.getenv("EATR_ACCESS_KEY", "").strip()
+GROUP_KEY    = os.getenv("EATR_GROUP_KEY", "").strip()
+ENDPOINT     = os.getenv("EATR_ENDPOINT_URL", "http://ws.eatright.org/service/service.svc").strip()
+WSDL_URL     = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
+REGION_XLSX  = os.getenv("REGION_ZIPS_PATH", "assets/nysand_region_zips.xlsx")
+CSV_FALLBACK = os.getenv("API_CSV_FALLBACK", "assets/api_seed.csv")  # file path (optional)
+CSV_B64_ENV  = os.getenv("API_CSV_BASE64", "")  # base64 of CSV (optional)
 
-def _post_http_no_https_redirect(url: str, data: bytes, headers: dict, timeout: int = 90) -> requests.Response:
-    """
-    POST without following redirects. If server tries to redirect to HTTPS,
-    rewrite back to HTTP and retry once.
-    """
-    r = requests.post(url, data=data, headers=headers, timeout=timeout, allow_redirects=False)
-    if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
-        loc = r.headers.get("Location", "")
-        if loc:
-            p = urlparse(loc)
-            if p.scheme.lower() == "https":
-                p = p._replace(scheme="http")
-                http_loc = urlunparse(p)
-                r2 = requests.post(http_loc, data=data, headers=headers, timeout=timeout, allow_redirects=False)
-                return r2
-    return r
+SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+API_NS  = "http://eatright/membership"
 
-def _clean_zip(s):
-    return re.sub(r"\D+", "", str(s or ""))[:5]
+def _wsdl_actions_map() -> dict:
+    try:
+        r = requests.get(WSDL_URL, timeout=60)
+        r.raise_for_status()
+        doc = xmltodict.parse(r.text)
+    except Exception:
+        return {}
+    actions = {}
+    defs = doc.get("wsdl:definitions") or doc.get("definitions") or {}
+    bindings = defs.get("wsdl:binding") or defs.get("binding") or []
+    if isinstance(bindings, dict):
+        bindings = [bindings]
+    for b in bindings:
+        ops = b.get("wsdl:operation") or b.get("operation") or []
+        if isinstance(ops, dict):
+            ops = [ops]
+        for op in ops:
+            name = op.get("@name")
+            if not name:
+                continue
+            # SOAP 1.1
+            soap_op = op.get("soap:operation")
+            if isinstance(soap_op, dict) and "@soapAction" in soap_op:
+                actions.setdefault(name, []).append(soap_op["@soapAction"])
+            # SOAP 1.2
+            soap12_op = op.get("soap12:operation")
+            if isinstance(soap12_op, dict) and "@soapAction" in soap12_op:
+                actions.setdefault(name, []).append(soap12_op["@soapAction"])
+    return actions
 
-def ensure_zip_col(df: pd.DataFrame) -> pd.DataFrame:
-    zcols = [c for c in df.columns if c.lower() in
-             ("zip","zipcode","zip code","postal","postalcode","home zip","primary zip")]
-    if not zcols:
-        df["Zip_clean"] = ""
-        return df
-    z = zcols[0]
-    df["Zip_clean"] = df[z].map(_clean_zip).fillna("")
-    return df
+_WSDL_ACTIONS = _wsdl_actions_map()
 
-def load_region_mapping(region_xlsx_path: str | None) -> dict | None:
-    """Return dict of DataFrames keyed by sheet name, or None."""
-    cand = None
-    if region_xlsx_path and os.path.exists(region_xlsx_path):
-        cand = region_xlsx_path
-    elif os.path.exists(DEFAULT_REGION_ASSET):
-        cand = DEFAULT_REGION_ASSET
-    elif os.path.exists("nysand_region_zips.xlsx"):
-        cand = "nysand_region_zips.xlsx"
-    if not cand:
-        return None
-    return pd.read_excel(cand, sheet_name=None)
+def _soap_envelope(body_xml: str, access_key: str | None) -> str:
+    header = (
+        f"""
+        <s:Header>
+          <AccessKey xmlns="{API_NS}" xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+            <Value>{access_key}</Value>
+          </AccessKey>
+        </s:Header>
+        """ if access_key else "<s:Header/>"
+    )
+    return f"""<s:Envelope xmlns:s="{SOAP_NS}">
+{header}
+  <s:Body>
+{body_xml}
+  </s:Body>
+</s:Envelope>""".strip()
 
-def region_concat_map(sheets: dict) -> pd.DataFrame:
-    acc = []
-    for _, df in sheets.items():
-        cols = {c.lower(): c for c in df.columns}
-        zip_col = cols.get("zip") or cols.get("zipcode") or list(df.columns)[0]
-        out = pd.DataFrame()
-        out["Zip"] = df[zip_col].astype(str).str.replace(r"\D+","", regex=True).str.zfill(5)
-        out["County"] = df[cols.get("county")].astype(str).str.strip() if "county" in cols else ""
-        out["Region"] = df[cols.get("region")].astype(str).str.strip() if "region" in cols else ""
-        out = out[out["Zip"].str.len()==5]
-        acc.append(out[["Zip","County","Region"]])
-    m = pd.concat(acc, ignore_index=True)
-    return m.drop_duplicates(subset=["Zip"]).reset_index(drop=True)
-
-def soap_envelope_xmlns(access_key: str, group_key: str, include_custom=True, xmlns="http://eatright/membership") -> str:
-    """
-    Build SOAP 1.1 envelope with a selectable XML namespace for the GetMembers op.
-    Some hosts expect http://eatright/membership, others http://eatright.org/.
-    """
-    return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <GetMembers xmlns="{xmlns}">
-      <AccessKey>{access_key}</AccessKey>
-      <GroupKey>{group_key}</GroupKey>
-      <IncludeCustomProperties>{'true' if include_custom else 'false'}</IncludeCustomProperties>
-    </GetMembers>
-  </soap:Body>
-</soap:Envelope>
-"""
-
-def _try_post(endpoint: str, access_key: str, group_key: str, include_custom: bool) -> requests.Response:
-    """
-    Try both SOAPAction/namespace combos against the given endpoint:
-      1) SOAPAction: http://eatright/membership/GetMembers  (xmlns=http://eatright/membership)
-      2) SOAPAction: http://eatright.org/GetMembers        (xmlns=http://eatright.org/)
-    Return the first 2xx response; otherwise return the last response for error handling.
-    """
-    combos = [
-        ("http://eatright/membership/GetMembers", "http://eatright/membership"),
-        ("http://eatright.org/GetMembers",        "http://eatright.org/"),
+def _post_soap(action: str, envelope_xml: str) -> dict:
+    base = API_NS
+    candidates = list(dict.fromkeys(_WSDL_ACTIONS.get(action, [])))
+    candidates += [
+        f"{base}/{action}",
+        f"{base}/IService/{action}",
+        f"{base}/IWcfAdaMembership/{action}",
+        "",
     ]
-    last = None
-    for action, ns in combos:
+    last_body = ""
+    errors = []
+    for sa in candidates:
         headers = {
             "Content-Type": "text/xml; charset=utf-8",
-            "SOAPAction": action,
+            "Accept": "text/xml",
+            "SOAPAction": f"\"{sa}\"" if sa is not None else ""
         }
-        body = soap_envelope_xmlns(access_key, group_key, include_custom, xmlns=ns).encode("utf-8")
-        resp = _post_http_no_https_redirect(endpoint, data=body, headers=headers, timeout=90)
-        print(f"[{datetime.utcnow().isoformat()}Z] Tried SOAPAction={action} ns={ns} → status={resp.status_code}")
-        last = resp
-        if 200 <= resp.status_code < 300:
-            return resp
-    return last
+        try:
+            r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
+            last_body = r.text or ""
+            # save last response for CI artifact
+            try:
+                with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+                    f.write(last_body)
+            except Exception:
+                pass
+            if r.status_code >= 400:
+                # parse Fault if present
+                try:
+                    doc = xmltodict.parse(last_body)
+                    fault = (doc.get("s:Envelope", {}).get("s:Body", {}).get("s:Fault")
+                             or doc.get("Envelope", {}).get("Body", {}).get("Fault"))
+                    if fault:
+                        fs = fault.get("faultstring") or fault.get("faultcode") or "SOAP Fault"
+                        errors.append(f"SOAPAction={headers.get('SOAPAction','')} → Fault: {fs}")
+                        continue
+                except Exception:
+                    pass
+                errors.append(f"SOAPAction={headers.get('SOAPAction','')} → HTTP {r.status_code}")
+                continue
+            return xmltodict.parse(last_body)
+        except Exception as e:
+            errors.append(f"SOAPAction={headers.get('SOAPAction','')} → {e}")
+    if last_body:
+        try:
+            with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+                f.write(last_body)
+        except Exception:
+            pass
+    raise RuntimeError(" ; ".join(errors) or "All SOAP attempts failed")
 
-def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom=True) -> pd.DataFrame:
-    endpoint = force_http(endpoint)
-    print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme={urlparse(endpoint).scheme}")
-
-    # 1) Try given endpoint with both SOAPAction variants
-    resp = _try_post(endpoint, access_key, group_key, include_custom)
-
-    # 2) If not OK, try alternate host with both variants (HTTP only)
-    if not (200 <= resp.status_code < 300):
-        alt = "http://ws.eatright.org/service/service.svc" \
-              if "reports.eatright.org" in endpoint else \
-              "http://reports.eatright.org/MemberServices/MemberService.asmx"
-        print(f"[{datetime.utcnow().isoformat()}Z] Falling back to alternate host: {alt}")
-        resp = _try_post(alt, access_key, group_key, include_custom)
-
-    resp.raise_for_status()
-    parsed = xmltodict.parse(resp.text)
-
-    # best-effort crawl to find member dicts
+def _find_members_anywhere(obj):
+    CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}
     out = []
-    def is_member(d):
+    def is_member_dict(d):
         if not isinstance(d, dict): return False
-        k = {k.lower() for k in d.keys()}
-        return any(t in k for t in ("name","firstname","lastname","zip","zipcode","email"))
-    def walk(n):
-        if isinstance(n, dict):
-            if is_member(n): out.append(n)
-            for v in n.values(): walk(v)
-        elif isinstance(n, list):
-            for v in n: walk(v)
-    walk(parsed)
-    if not out:
-        out = [parsed]
-    df = pd.json_normalize(out, max_level=3).drop_duplicates().reset_index(drop=True)
-    return ensure_zip_col(df)
+        keys = {k.split(":", 1)[-1] for k in d.keys()}
+        return len(CANDIDATE_KEYS.intersection(keys)) >= 2
+    def walk(x):
+        nonlocal out
+        if isinstance(x, list):
+            if x and all(isinstance(i, dict) for i in x) and any(is_member_dict(i) for i in x):
+                out.extend([i for i in x if isinstance(i, dict)])
+                return
+            for i in x: walk(i)
+        elif isinstance(x, dict):
+            if is_member_dict(x):
+                out.append(x); return
+            for v in x.values(): walk(v)
+    walk(obj)
+    return out
 
-def build_zip_blob(members_df: pd.DataFrame, region_sheets: dict) -> bytes:
-    region_map = region_concat_map(region_sheets)
-    merged = members_df.merge(region_map, left_on="Zip_clean", right_on="Zip", how="left")
-    regions = sorted(merged["Region"].dropna().unique().tolist()) if "Region" in merged.columns else []
+def _clean_zip(z):
+    if z is None or (isinstance(z, float) and pd.isna(z)): return None
+    s = str(z).strip()
+    if not s: return None
+    m = re.search(r"\b(\d{5})\b", s)
+    return m.group(1) if m else None
+
+def _ensure_member_zip_column(df: pd.DataFrame) -> None:
+    cand = [c for c in df.columns if c.lower() in ("zip", "zipcode", "postalcode", "postal_code")]
+    df["Zip"] = df[cand[0]] if cand else None
+
+def fetch_members_via_api(include_custom_props: bool = True) -> pd.DataFrame:
+    method = "RetrieveGroupMembersWithCustomProperties" if include_custom_props else "RetrieveGroupMembers"
+    body = f"""
+    <{method} xmlns="{API_NS}">
+      <groupKey>{GROUP_KEY}</groupKey>
+    </{method}>
+    """.strip()
+    env = _soap_envelope(body, access_key=ACCESS_KEY)
+    data = _post_soap(method, env)
+
+    body_node = (data.get("s:Envelope") or data.get("Envelope") or {}).get("s:Body") or data.get("Body") or {}
+    resp_key, res_key = f"{method}Response", f"{method}Result"
+    node = body_node.get(resp_key) or body_node.get(res_key) or body_node
+    if isinstance(node, dict) and res_key in node:
+        node = node[res_key]
+
+    rows = _find_members_anywhere(node)
+    if not rows and isinstance(node, dict):
+        container = node
+        for k in ("a:Members", "Members"):
+            if k in container:
+                container = container[k]
+        members = None
+        if isinstance(container, dict):
+            members = container.get("a:Member") or container.get("Member")
+        rows = [members] if isinstance(members, dict) else (members or [])
+    if not rows:
+        return pd.DataFrame()
+
+    def strip_ns(d):
+        return {k.split(":", 1)[-1]: v for k, v in d.items()} if isinstance(d, dict) else {}
+    df = pd.DataFrame([strip_ns(r) for r in rows])
+
+    if "CustomProperties" in df.columns:
+        def props_to_dict(v):
+            if not isinstance(v, dict): return {}
+            items = v.get("a:CustomProperty") or v.get("CustomProperty") or []
+            if isinstance(items, dict): items = [items]
+            out = {}
+            for it in items:
+                if not isinstance(it, dict): continue
+                name = it.get("a:Name") or it.get("Name")
+                val  = it.get("a:Value") or it.get("Value")
+                if name: out[str(name)] = val
+            return out
+        props = df["CustomProperties"].apply(props_to_dict).apply(pd.Series)
+        df = pd.concat([df.drop(columns=["CustomProperties"]), props], axis=1)
+
+    _ensure_member_zip_column(df)
+    return df
+
+def _load_region_map(xlsx_path: str) -> pd.DataFrame:
+    sheets = pd.read_excel(xlsx_path, sheet_name=None)
+    z = pd.DataFrame()
+    for _, d in sheets.items():
+        t = d.iloc[:, :3].copy()
+        t.columns = ["County", "Zip", "Region"]
+        z = pd.concat([z, t], ignore_index=True)
+    z["Zip"] = z["Zip"].map(_clean_zip)
+    z = z[z["Zip"].notna()].copy()
+    z["Zip"] = z["Zip"].astype(str).str.zfill(5)
+    z = z.drop_duplicates(subset=["Zip"], keep="first")
+    return z
+
+def _group_and_zip(members_df: pd.DataFrame, region_map: pd.DataFrame) -> bytes:
+    members = members_df.copy()
+    members["Zip_clean"] = members["Zip"].map(_clean_zip).astype("string")
+    members.loc[members["Zip_clean"].notna(), "Zip_clean"] = members.loc[members["Zip_clean"].notna(), "Zip_clean"].str.zfill(5)
+    merged = pd.merge(members, region_map, left_on="Zip_clean", right_on="Zip", how="left")
 
     with tempfile.TemporaryDirectory() as td:
-        zip_path = os.path.join(td, "NYSAND_Member_Files.zip")
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        out_zip = os.path.join(td, "NYSAND_Member_Files.zip")
+        with zipfile.ZipFile(out_zip, "w") as zf:
             # per-region
-            for r in regions:
-                r_df = merged[merged["Region"] == r].copy()
-                safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(r))
-                p = os.path.join(td, f"members_{safe}.csv")
-                r_df.to_csv(p, index=False)
-                zf.write(p, arcname=f"regions/members_{safe}.csv")
-            # debug
-            p = os.path.join(td, "debug_merged_full.csv"); merged.to_csv(p, index=False); zf.write(p, arcname="debug/merged_full.csv")
-            p = os.path.join(td, "debug_region_map.csv"); region_map.to_csv(p, index=False); zf.write(p, arcname="debug/region_map_standardized.csv")
-            p = os.path.join(td, "debug_unmatched.csv"); merged[merged["Region"].isna()].to_csv(p, index=False); zf.write(p, arcname="debug/unmatched.csv")
-        with open(zip_path, "rb") as f:
-            return f.read()
+            grp = merged[merged["Region"].notna()].groupby("Region")
+            for region, df in grp:
+                safe = str(region).replace("/", "-").replace(" ", "_")
+                f = os.path.join(td, f"{safe}_Members.xlsx")
+                df.to_excel(f, index=False)
+                zf.write(f, arcname=os.path.basename(f))
+            # unmatched
+            unmatched = merged[merged["Region"].isna()]
+            f = os.path.join(td, "Unmatched_OutOfState_Members.xlsx")
+            unmatched.to_excel(f, index=False)
+            zf.write(f, arcname="Unmatched_OutOfState_Members.xlsx")
+        return open(out_zip, "rb").read()
 
-# ---------- CLI ----------
+def _load_fallback_csv() -> pd.DataFrame:
+    if CSV_B64_ENV:
+        try:
+            raw = base64.b64decode(CSV_B64_ENV)
+            return pd.read_csv(pd.io.common.BytesIO(raw))
+        except Exception:
+            pass
+    if CSV_FALLBACK and os.path.exists(CSV_FALLBACK):
+        return pd.read_csv(CSV_FALLBACK)
+    raise RuntimeError("No API_CSV_BASE64 or assets/api_seed.csv found for fallback")
+
 def main():
-    ap = argparse.ArgumentParser(description="Generate NYSAND per-region ZIP (headless)")
-    ap.add_argument("--region-xlsx", help="Path to region zipcodes Excel (optional; defaults to assets)")
-    ap.add_argument("--out", default="out/NYSAND_Member_Files.zip", help="Output ZIP path")
-    ap.add_argument("--include-custom", action="store_true", help="Include custom properties (slower, richer)")
-    args = ap.parse_args()
-
-    endpoint = os.environ.get("EATR_ENDPOINT_URL") or "http://reports.eatright.org/MemberServices/MemberService.asmx"
-    access  = os.environ.get("EATR_ACCESS_KEY")
-    group   = os.environ.get("EATR_GROUP_KEY")
-    if not access or not group:
-        print("ERROR: EATR_ACCESS_KEY and EATR_GROUP_KEY must be set in env.", file=sys.stderr)
-        return 2
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    print(f"[{datetime.utcnow().isoformat()}Z] Fetching members… endpoint=***")
+    if ENDPOINT.lower().startswith("http://"):
+        print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme=http")
 
     try:
-        print(f"[{datetime.utcnow().isoformat()}Z] Fetching members… endpoint={endpoint}")
-        members = fetch_members(endpoint, access, group, include_custom=args.include_custom)
-        print(f"Fetched {len(members):,} members")
-
-        region_sheets = load_region_mapping(args.region_xlsx)
-        if region_sheets is None:
-            print("ERROR: Region mapping Excel not found (assets/nysand_region_zips.xlsx or provided path).", file=sys.stderr)
-            return 3
-
-        blob = build_zip_blob(members, region_sheets)
-        os.makedirs(os.path.dirname(args.out), exist_ok=True)
-        with open(args.out, "wb") as f:
-            f.write(blob)
-        print(f"Wrote ZIP → {args.out}")
-        return 0
-    except requests.HTTPError as e:
-        print(f"HTTPError: {e}", file=sys.stderr)
-        return 10
+        members = fetch_members_via_api(include_custom_props=True)
+        if members.empty:
+            raise RuntimeError("API returned 0 rows (empty).")
+        print(f"[{datetime.utcnow().isoformat()}Z] API returned {len(members)} rows")
     except Exception as e:
-        print(f"Unhandled error: {e}", file=sys.stderr)
-        return 99
+        print(f"[{datetime.utcnow().isoformat()}Z] API fetch failed: {e}", file=sys.stderr)
+        print(f"[{datetime.utcnow().isoformat()}Z] Falling back to CSV…", file=sys.stderr)
+        members = _load_fallback_csv()
+        print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV rows: {len(members)}")
+
+    region = _load_region_map(REGION_XLSX)
+    blob = _group_and_zip(members, region)
+    with open(OUT_PATH, "wb") as f:
+        f.write(blob)
+    print(f"[{datetime.utcnow().isoformat()}Z] Wrote ZIP → {OUT_PATH}")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
