@@ -11,6 +11,23 @@ import xmltodict
 # ---------- Config & helpers ----------
 DEFAULT_REGION_ASSET = "assets/nysand_region_zips.xlsx"
 
+# add this helper (anywhere above fetch_members)
+def force_http(url: str | None) -> str:
+    if not url:
+        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
+    u = url.strip()
+    p = urlparse(u)
+    # Coerce https→http while preserving host/path/query
+    if p.scheme.lower() == "https":
+        p = p._replace(scheme="http")
+        u = urlunparse(p)
+    # Normalize known ADA endpoints explicitly
+    if "reports.eatright.org/MemberServices/MemberService.asmx" in u:
+        return "http://reports.eatright.org/MemberServices/MemberService.asmx"
+    if "ws.eatright.org/service/service.svc" in u:
+        return "http://ws.eatright.org/service/service.svc"
+    return u
+
 def _clean_zip(s):
     return re.sub(r"\D+", "", str(s or ""))[:5]
 
@@ -67,7 +84,10 @@ def soap_envelope(access_key: str, group_key: str, include_custom=True) -> str:
 </soap:Envelope>
 """
 
+# modify fetch_members to force HTTP and log the scheme
 def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom=True) -> pd.DataFrame:
+    endpoint = force_http(endpoint)
+    print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme={urlparse(endpoint).scheme}")
     headers = {
         "Content-Type": "text/xml; charset=utf-8",
         "SOAPAction": "http://eatright.org/GetMembers",
@@ -75,6 +95,7 @@ def fetch_members(endpoint: str, access_key: str, group_key: str, include_custom
     body = soap_envelope(access_key, group_key, include_custom)
     r = requests.post(endpoint, data=body.encode("utf-8"), headers=headers, timeout=90)
     r.raise_for_status()
+
     parsed = xmltodict.parse(r.text)
 
     # best-effort crawl to find member dicts
