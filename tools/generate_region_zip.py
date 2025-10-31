@@ -24,6 +24,25 @@ INCLUDE_CUSTOM = os.getenv("EATR_INCLUDE_CUSTOM", "false").strip().lower() in ("
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
 
+def _endpoint_candidates():
+    # Start with env if provided
+    cands = []
+    if ENDPOINT:
+        cands.append(ENDPOINT)
+    # Known ADA variants
+    cands += [
+        "http://ws.eatright.org/service/service.svc",
+        "http://ws.eatright.org/service2/service.svc",
+        "https://ws.eatright.org/service/service.svc",
+    ]
+    # Deduplicate preserving order
+    out, seen = [], set()
+    for e in cands:
+        if e and e not in seen:
+            out.append(e); seen.add(e)
+    return out
+
+
 # --- diagnostics ---
 print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint → {ENDPOINT}")
 
@@ -257,23 +276,32 @@ def run_build(out_path: str):
     if ENDPOINT.lower().startswith("http://"):
         print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme=http")
 
-    # Try preferred mode first, then the other mode as auto-fallback
-    try_modes = [INCLUDE_CUSTOM, not INCLUDE_CUSTOM]
+    # Try endpoint x method combos until one returns non-empty
     members = pd.DataFrame()
-    last_err = None
-    for mode in try_modes:
-        try:
-            print(f"[{datetime.utcnow().isoformat()}Z] Calling API include_custom_props={mode}")
-            m = fetch_members_via_api(include_custom_props=mode)
-            if not m.empty:
-                members = m
-                print(f"[{datetime.utcnow().isoformat()}Z] API returned {len(members)} rows (include_custom_props={mode})")
-                break
-            else:
-                last_err = RuntimeError("API returned 0 rows")
-        except Exception as e:
-            last_err = e
-            print(f"[{datetime.utcnow().isoformat()}Z] API call failed (include_custom_props={mode}): {e}", file=sys.stderr)
+    errors = []
+    for ep in _endpoint_candidates():
+        # temporarily override ENDPOINT for this attempt
+        global ENDPOINT, WSDL_URL
+        ENDPOINT = ep
+        WSDL_URL = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
+        print(f"[{datetime.utcnow().isoformat()}Z] Trying endpoint: {ENDPOINT}")
+
+        for mode in (INCLUDE_CUSTOM, not INCLUDE_CUSTOM):
+            try:
+                print(f"[{datetime.utcnow().isoformat()}Z] Calling API include_custom_props={mode}")
+                m = fetch_members_via_api(include_custom_props=mode)
+                if not m.empty:
+                    members = m
+                    print(f"[{datetime.utcnow().isoformat()}Z] ✅ API returned {len(members)} rows (endpoint={ENDPOINT}, include_custom_props={mode})")
+                    break
+                else:
+                    errors.append(f"endpoint={ENDPOINT} mode={mode} → 0 rows")
+            except Exception as e:
+                msg = str(e)
+                errors.append(f"endpoint={ENDPOINT} mode={mode} → {msg}")
+                print(f"[{datetime.utcnow().isoformat()}Z] API call failed: {msg}", file=sys.stderr)
+        if not members.empty:
+            break
 
     if members.empty:
         print(f"[{datetime.utcnow().isoformat()}Z] Falling back to CSV…", file=sys.stderr)
@@ -282,7 +310,9 @@ def run_build(out_path: str):
             print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV rows: {len(members)}")
         except Exception as e:
             print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV load failed: {e}", file=sys.stderr)
-            raise last_err or e
+            # Surface the most helpful upstream error
+            raise RuntimeError(" | ".join(errors) or "API did not return data")
+
 
     region = _load_region_map(REGION_XLSX)
     blob = _group_and_zip(members, region)
