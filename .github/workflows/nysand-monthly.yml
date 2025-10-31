@@ -49,7 +49,7 @@ jobs:
 
       - name: Echo endpoint (sanity)
         env:
-          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+          EATR_ENDPOINT_URL: http://ws.eatright.org/service/service.svc
         run: |
           echo "EATR_ENDPOINT_URL='${EATR_ENDPOINT_URL}'"
 
@@ -57,7 +57,7 @@ jobs:
         env:
           EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
           EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
-          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+          EATR_ENDPOINT_URL: http://ws.eatright.org/service/service.svc
         run: |
           set -e
           python - <<'PY'
