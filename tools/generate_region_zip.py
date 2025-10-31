@@ -75,37 +75,37 @@ def _soap_envelope(body_xml: str, access_key: str | None) -> str:
 </s:Envelope>""".strip()
 
 def _post_soap(action: str, envelope_xml: str) -> dict:
-    """Send SOAP request trying membership and org namespaces (WCF tolerant)."""
-    candidates = [
-        f"http://eatright.org/membership/IWcfAdaMembership/{action}",
-        f"http://eatright.org/membership/IService/{action}",
-        f"http://eatright.org/membership/{action}"
-    ]
+    """Send SOAP request using the correct WCF contract namespace (service.svc)."""
+    soap_action = f"http://eatright.org/membership/IWcfAdaMembership/{action}"
+    headers = {
+        "Content-Type": "text/xml; charset=utf-8",
+        "Accept": "text/xml",
+        "SOAPAction": f"\"{soap_action}\"",
+    }
 
-    last_body, errors = "", []
-    for sa in candidates:
-        headers = {
-            "Content-Type": "text/xml; charset=utf-8",
-            "Accept": "text/xml",
-            "SOAPAction": f"\"{sa}\""
-        }
+    try:
+        r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=90)
+        body = r.text or ""
+        # Always write body for diagnostics
         try:
-            r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=60)
-            last_body = r.text or ""
             with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
-                f.write(last_body)
-            if r.status_code >= 400:
-                errors.append(f"{sa} → HTTP {r.status_code}")
-                continue
-            return xmltodict.parse(last_body)
-        except Exception as e:
-            errors.append(f"{sa} → {e}")
+                f.write(body)
+        except Exception:
+            pass
 
-    if last_body:
-        with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
-            f.write(last_body)
-    raise RuntimeError("All SOAP attempts failed: " + "; ".join(errors))
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code} for SOAPAction {soap_action}")
 
+        return xmltodict.parse(body)
+
+    except Exception as e:
+        # On failure, write the exception text for quick debugging and re-raise
+        try:
+            with open("/tmp/soap_response.xml", "w", encoding="utf-8") as f:
+                f.write(str(e))
+        except Exception:
+            pass
+        raise
 
 def _find_members_anywhere(obj):
     CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}
