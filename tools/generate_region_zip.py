@@ -11,19 +11,33 @@ def _endpoint() -> str:
     """Resolve endpoint with environment or fallback to default WCF service."""
     return os.getenv("EATR_ENDPOINT_URL", "http://ws.eatright.org/service/service.svc").strip()
 
-ACCESS_KEY   = os.getenv("EATR_ACCESS_KEY", "").strip()
-GROUP_KEY    = os.getenv("EATR_GROUP_KEY", "").strip()
-ENDPOINT     = _endpoint()
-WSDL_URL     = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
-REGION_XLSX  = os.getenv("REGION_ZIPS_PATH", "assets/nysand_region_zips.xlsx")
-CSV_FALLBACK = os.getenv("API_CSV_FALLBACK", "assets/api_seed.csv")
-CSV_B64_ENV  = os.getenv("API_CSV_BASE64", "")
+ACCESS_KEY    = os.getenv("EATR_ACCESS_KEY", "").strip()
+GROUP_KEY     = os.getenv("EATR_GROUP_KEY", "").strip()
+ENDPOINT      = _endpoint()
+WSDL_URL      = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
+REGION_XLSX   = os.getenv("REGION_ZIPS_PATH", "assets/nysand_region_zips.xlsx")
+CSV_FALLBACK  = os.getenv("API_CSV_FALLBACK", "assets/api_seed.csv")
+CSV_B64_ENV   = os.getenv("API_CSV_BASE64", "")
+# default to SAFE method (no custom props) unless explicitly enabled
+INCLUDE_CUSTOM = os.getenv("EATR_INCLUDE_CUSTOM", "false").strip().lower() in ("1", "true", "yes", "on")
 
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
 
 # --- diagnostics ---
 print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint → {ENDPOINT}")
+
+def _mask(s: str) -> str:
+    if not s:
+        return "(empty)"
+    s = str(s)
+    return "*" * len(s) if len(s) <= 6 else f"{s[:3]}…{s[-3:]}"
+
+print(
+    f"ACCESS_KEY len={len(ACCESS_KEY)} val={_mask(ACCESS_KEY)} | "
+    f"GROUP_KEY len={len(GROUP_KEY)} val={_mask(GROUP_KEY)} | "
+    f"INCLUDE_CUSTOM={INCLUDE_CUSTOM}"
+)
 
 def _wsdl_actions_map() -> dict:
     try:
@@ -82,7 +96,6 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
         "Accept": "text/xml",
         "SOAPAction": f"\"{soap_action}\"",
     }
-
     try:
         r = requests.post(ENDPOINT, data=envelope_xml.encode("utf-8"), headers=headers, timeout=90)
         body = r.text or ""
@@ -244,16 +257,32 @@ def run_build(out_path: str):
     if ENDPOINT.lower().startswith("http://"):
         print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme=http")
 
-    try:
-        members = fetch_members_via_api(include_custom_props=True)
-        if members.empty:
-            raise RuntimeError("API returned 0 rows (empty).")
-        print(f"[{datetime.utcnow().isoformat()}Z] API returned {len(members)} rows")
-    except Exception as e:
-        print(f"[{datetime.utcnow().isoformat()}Z] API fetch failed: {e}", file=sys.stderr)
+    # Try preferred mode first, then the other mode as auto-fallback
+    try_modes = [INCLUDE_CUSTOM, not INCLUDE_CUSTOM]
+    members = pd.DataFrame()
+    last_err = None
+    for mode in try_modes:
+        try:
+            print(f"[{datetime.utcnow().isoformat()}Z] Calling API include_custom_props={mode}")
+            m = fetch_members_via_api(include_custom_props=mode)
+            if not m.empty:
+                members = m
+                print(f"[{datetime.utcnow().isoformat()}Z] API returned {len(members)} rows (include_custom_props={mode})")
+                break
+            else:
+                last_err = RuntimeError("API returned 0 rows")
+        except Exception as e:
+            last_err = e
+            print(f"[{datetime.utcnow().isoformat()}Z] API call failed (include_custom_props={mode}): {e}", file=sys.stderr)
+
+    if members.empty:
         print(f"[{datetime.utcnow().isoformat()}Z] Falling back to CSV…", file=sys.stderr)
-        members = _load_fallback_csv()
-        print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV rows: {len(members)}")
+        try:
+            members = _load_fallback_csv()
+            print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV rows: {len(members)}")
+        except Exception as e:
+            print(f"[{datetime.utcnow().isoformat()}Z] Fallback CSV load failed: {e}", file=sys.stderr)
+            raise last_err or e
 
     region = _load_region_map(REGION_XLSX)
     blob = _group_and_zip(members, region)
