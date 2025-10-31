@@ -8,6 +8,7 @@ import pandas as pd
 import requests
 import streamlit as st
 import xmltodict
+from zoneinfo import ZoneInfo
 
 # ---- persistence slots (added for download link persistence) ----
 st.session_state.setdefault("region_blob", None)
@@ -512,30 +513,30 @@ if source == "Manual Upload":
                     st.warning(f"Debug panel could not render: {e}")
 
             # --- Create outputs ---
-            with st.spinner("Processing files..."):
-                blob = process_and_package(members_df, region_sheets)
+with st.spinner("Processing files..."):
+    blob = process_and_package(members_df, region_sheets)
 
-                # Persist ZIP so it stays after reruns
-                st.session_state["region_blob"] = blob
-                st.session_state["region_blob_ts"] = datetime.now().strftime("%Y-%m-%d")
+# Persist ZIP so it stays after reruns (timestamp in Eastern Time)
+ts_local = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
+st.session_state["region_blob"] = blob
+st.session_state["region_blob_ts"] = ts_local
 
-            st.success("✅ Done! Download your ZIP below.")
-            st.download_button(
-                "📥 Download All Files (ZIP)",
-                blob,
-                file_name="NYSAND_Member_Files.zip",
-                key="dl_region_zip_manual"
-            )
+st.success("✅ Done! Download your ZIP below.")
+st.download_button(
+    "📥 Download All Files (ZIP)",
+    blob,
+    file_name="NYSAND_Member_Files.zip",
+    key="dl_region_zip_manual"
+)
 
-            # Resume last ZIP if available
-            if st.session_state.get("region_blob"):
-                label_ts = st.session_state.get("region_blob_ts")
-                st.download_button(
-                    f"📦 Re-download last ZIP" + (f" (built {label_ts})" if label_ts else ""),
-                    st.session_state["region_blob"],
-                    file_name="NYSAND_Member_Files.zip",
-                    key="dl_region_zip_resume_manual"
-                )
+# Only show 'Re-download last ZIP' if it’s from a prior run
+if st.session_state.get("region_blob") is not None and st.session_state["region_blob"] is not blob:
+    st.download_button(
+        f"📦 Re-download last ZIP (built {st.session_state.get('region_blob_ts','')})",
+        st.session_state["region_blob"],
+        file_name="NYSAND_Member_Files.zip",
+        key="dl_region_zip_resume_manual"
+    )
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
@@ -629,30 +630,30 @@ elif source == "EatRight SOAP API":
                 )
 
             # ---- Create and offer the region ZIP ("Process into region files")
-            with st.spinner("Creating region files…"):
-                blob = process_and_package(api_df, region_sheets)
-            today = datetime.now().strftime("%Y-%m-%d")
+with st.spinner("Creating region files…"):
+    blob = process_and_package(api_df, region_sheets)
 
-            # Persist for reruns
-            st.session_state["region_blob"] = blob
-            st.session_state["region_blob_ts"] = today
+# Persist for reruns (timestamp in Eastern Time)
+ts_local = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
+st.session_state["region_blob"] = blob
+st.session_state["region_blob_ts"] = ts_local
 
-            st.success("✅ Done! Download your ZIP below.")
-            st.download_button(
-                "📥 Download All Files (ZIP)",
-                blob,
-                file_name=f"NYSAND_Member_Files_{today}.zip",
-                key="dl_region_zip_api"
-            )
+st.success("✅ Done! Download your ZIP below.")
+st.download_button(
+    "📥 Download All Files (ZIP)",
+    blob,
+    file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
+    key="dl_region_zip_api"
+)
 
-            # Resume last ZIP if available
-            if st.session_state.get("region_blob"):
-                st.download_button(
-                    f"📦 Re-download last ZIP (built {today})",
-                    st.session_state["region_blob"],
-                    file_name=f"NYSAND_Member_Files_{today}.zip",
-                    key="dl_region_zip_resume_api"
-                )
+# Only show 'Re-download last ZIP' if it’s from a prior run
+if st.session_state.get("region_blob") is not None and st.session_state["region_blob"] is not blob:
+    st.download_button(
+        f"📦 Re-download last ZIP (built {st.session_state.get('region_blob_ts','')})",
+        st.session_state["region_blob"],
+        file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
+        key="dl_region_zip_resume_api"
+    )
 
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
@@ -680,4 +681,5 @@ with st.sidebar:
             file_name="NYSAND_Member_Files.zip",
             key="dl_region_zip_sidebar"
         )
+
 
