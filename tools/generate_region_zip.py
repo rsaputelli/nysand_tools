@@ -3,23 +3,13 @@ from datetime import datetime
 import pandas as pd
 import requests
 import xmltodict
-import argparse  # already imported, safe duplicate
+import argparse  # ok to import; just don't PARSE at import time
 
 # ---------- Config / Inputs ----------
 
-# 🟢 BEGIN INSERT: Explicit CLI + env handling
 def _endpoint() -> str:
     """Resolve endpoint with environment or fallback to default WCF service."""
     return os.getenv("EATR_ENDPOINT_URL", "http://ws.eatright.org/service/service.svc").strip()
-
-def _args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True, help="output ZIP path")
-    return ap.parse_args()
-
-ARGS = _args()
-OUT_PATH = ARGS.out
-# 🟢 END INSERT
 
 ACCESS_KEY   = os.getenv("EATR_ACCESS_KEY", "").strip()
 GROUP_KEY    = os.getenv("EATR_GROUP_KEY", "").strip()
@@ -149,7 +139,6 @@ def _post_soap(action: str, envelope_xml: str) -> dict:
             pass
 
     raise RuntimeError(" ; ".join(errors) or "All SOAP attempts failed")
-
 
 def _find_members_anywhere(obj):
     CANDIDATE_KEYS = {"RecordNumber", "LoginName", "PostalCode", "Zip", "FirstName", "LastName", "Email"}
@@ -281,9 +270,10 @@ def _load_fallback_csv() -> pd.DataFrame:
         return pd.read_csv(CSV_FALLBACK)
     raise RuntimeError("No API_CSV_BASE64 or assets/api_seed.csv found for fallback")
 
-def main():
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    print(f"[{datetime.utcnow().isoformat()}Z] Fetching members… endpoint=***")
+def run_build(out_path: str):
+    """Main build: fetch members, load region map, zip outputs, write to out_path."""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    print(f"[{datetime.utcnow().isoformat()}Z] Fetching members…")
     if ENDPOINT.lower().startswith("http://"):
         print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme=http")
 
@@ -300,9 +290,12 @@ def main():
 
     region = _load_region_map(REGION_XLSX)
     blob = _group_and_zip(members, region)
-    with open(OUT_PATH, "wb") as f:
+    with open(out_path, "wb") as f:
         f.write(blob)
-    print(f"[{datetime.utcnow().isoformat()}Z] Wrote ZIP → {OUT_PATH}")
+    print(f"[{datetime.utcnow().isoformat()}Z] Wrote ZIP → {out_path}")
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="output ZIP path")
+    args = ap.parse_args()
+    run_build(args.out)
