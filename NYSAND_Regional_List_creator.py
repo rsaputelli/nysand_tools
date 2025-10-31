@@ -554,13 +554,14 @@ elif source == "EatRight SOAP API":
             # Include/exclude custom props
             use_custom = st.checkbox("Include custom properties (slower, richer)", value=True)
 
+            # --- Fetch via API
             with st.spinner("Fetching members from EatRight API…"):
                 api_df = fetch_members_via_api(ak, gk, include_custom_props=use_custom)
 
             st.success(f"Fetched {len(api_df):,} records.")
             st.dataframe(api_df.head(25))
 
-            # Offer the raw SOAP xml (from last call) for download
+            # Best-effort: expose raw SOAP response from last call
             try:
                 with open("/tmp/soap_response.xml", "r", encoding="utf-8") as f:
                     raw_xml = f.read()
@@ -575,9 +576,7 @@ elif source == "EatRight SOAP API":
             # Load region map (uploaded overrides bundled)
             region_sheets = load_region_mapping(region_file)
             if region_sheets is None:
-                st.error(
-                    "Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo."
-                )
+                st.error("Region mapping not found. Upload it above or add assets/nysand_region_zips.xlsx to the repo.")
                 st.stop()
 
             # ---- DEBUG panel (always available after a successful fetch)
@@ -630,30 +629,30 @@ elif source == "EatRight SOAP API":
                 )
 
             # ---- Create and offer the region ZIP ("Process into region files")
-with st.spinner("Creating region files…"):
-    blob = process_and_package(api_df, region_sheets)
+            with st.spinner("Creating region files…"):
+                blob = process_and_package(api_df, region_sheets)
 
-# Persist for reruns (timestamp in Eastern Time)
-ts_local = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
-st.session_state["region_blob"] = blob
-st.session_state["region_blob_ts"] = ts_local
+            # Persist for reruns (timestamp in Eastern Time)
+            ts_local = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M %Z")
+            st.session_state["region_blob"] = blob
+            st.session_state["region_blob_ts"] = ts_local
 
-st.success("✅ Done! Download your ZIP below.")
-st.download_button(
-    "📥 Download All Files (ZIP)",
-    blob,
-    file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
-    key="dl_region_zip_api"
-)
+            st.success("✅ Done! Download your ZIP below.")
+            st.download_button(
+                "📥 Download All Files (ZIP)",
+                blob,
+                file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
+                key="dl_region_zip_api"
+            )
 
-# Only show 'Re-download last ZIP' if it’s from a prior run
-if st.session_state.get("region_blob") is not None and st.session_state["region_blob"] is not blob:
-    st.download_button(
-        f"📦 Re-download last ZIP (built {st.session_state.get('region_blob_ts','')})",
-        st.session_state["region_blob"],
-        file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
-        key="dl_region_zip_resume_api"
-    )
+            # Only show 'Re-download last ZIP' if it’s from a prior run
+            if st.session_state.get("region_blob") is not None and st.session_state["region_blob"] is not blob:
+                st.download_button(
+                    f"📦 Re-download last ZIP (built {st.session_state.get('region_blob_ts','')})",
+                    st.session_state["region_blob"],
+                    file_name=f"NYSAND_Member_Files_{datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d')}.zip",
+                    key="dl_region_zip_resume_api"
+                )
 
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
