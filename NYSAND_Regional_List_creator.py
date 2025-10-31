@@ -3,6 +3,7 @@ import re
 import zipfile
 import tempfile
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -111,6 +112,12 @@ def _wsdl_action_for(method: str) -> list[str]:
 # =========================
 # Shared processing helpers
 # =========================
+def _et_label(fmt="%Y-%m-%d %H:%M %Z"):
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).strftime(fmt)
+    except Exception:
+        # Fallback to UTC if zoneinfo not available
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
 def _clean_zip(z):
     """Extract first 5 digits, return as 5-char string (drops +4 and non-digits)."""
@@ -531,12 +538,11 @@ if source == "Manual Upload":
             if st.session_state.get("region_blob"):
                 label_ts = st.session_state.get("region_blob_ts")
                 st.download_button(
-                    f"📦 Re-download last ZIP" + (f" (built {label_ts})" if label_ts else ""),
+                    f"📦 Re-download last ZIP (built {_et_label()})",
                     st.session_state["region_blob"],
                     file_name="NYSAND_Member_Files.zip",
                     key="dl_region_zip_resume_manual"
                 )
-
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
     region_file = st.file_uploader(
@@ -648,9 +654,9 @@ elif source == "EatRight SOAP API":
             # Resume last ZIP if available
             if st.session_state.get("region_blob"):
                 st.download_button(
-                    f"📦 Re-download last ZIP (built {today})",
+                    f"📦 Re-download last ZIP (built {_et_label()})",
                     st.session_state["region_blob"],
-                    file_name=f"NYSAND_Member_Files_{today}.zip",
+                    file_name=f"NYSAND_Member_Files_{_et_label('%Y-%m-%d')}.zip",
                     key="dl_region_zip_resume_api"
                 )
 
@@ -677,7 +683,7 @@ with st.sidebar:
         st.download_button(
             f"📦 Re-download last ZIP" + (f" (built {lbl})" if lbl else ""),
             st.session_state["region_blob"],
-            file_name="NYSAND_Member_Files.zip",
+            file_name=f"NYSAND_Member_Files_{_et_label('%Y-%m-%d')}.zip",
             key="dl_region_zip_sidebar"
         )
 
