@@ -2,9 +2,8 @@ name: NYSAND Monthly Build
 
 on:
   schedule:
-    # Run at 02:15 AM UTC on the 1st of each month
-    - cron: "15 2 1 * *"
-  workflow_dispatch: {}  # allow manual runs anytime
+    - cron: "15 2 1 * *"  # 02:15 UTC on the 1st of each month
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -23,44 +22,69 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -V
           python -m pip install --upgrade pip
-          # Use your pinned requirements, but ensure openpyxl (Excel writer) present
-          pip install -r requirements.txt
-          python -c "import openpyxl" 2>/dev/null || pip install openpyxl
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # Ensure these are present even if not pinned
+          pip install pandas requests xmltodict openpyxl
 
-      # ---- Guardrails / diagnostics ----
-      - name: Sanity check required files
+      - name: Sanity check repo layout
         run: |
-          echo "Repo root contents:"
+          echo "::group::ls -la"
           ls -la
-          echo "Assets contents:"
+          echo "::endgroup::"
+          echo "::group::ls -la assets"
           ls -la assets || true
-          # region map is required (bundled fallback)
+          echo "::endgroup::"
+          echo "::group::ls -la tools"
+          ls -la tools || true
+          echo "::endgroup::"
+
+      - name: Verify region map exists
+        run: |
           test -f assets/nysand_region_zips.xlsx || (echo "::error::Missing assets/nysand_region_zips.xlsx" && exit 1)
-          # create output dir
           mkdir -p out
 
-    - name: Echo endpoint (sanity)
-      env:
-        EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
-      run: |
-        echo "Endpoint is: ${EATR_ENDPOINT_URL}"
-
-    - name: Run headless generator
-      env:
-        EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
-        EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
-        EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
-      run: |
-        python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip
-
-          echo "Contents of out/:"
-          ls -la out
-
-      # ---- Hard stop if ZIP is empty or missing ----
-      - name: Fail if artifact is empty
+      - name: Echo endpoint (sanity)
+        env:
+          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
         run: |
-          test -s out/NYSAND_Member_Files.zip || (echo "::error::ZIP is empty or missing"; exit 1)
+          echo "EATR_ENDPOINT_URL='${EATR_ENDPOINT_URL}'"
+
+      - name: Run headless generator
+        env:
+          EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
+          EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
+          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+        run: |
+          set -e
+          python - <<'PY'
+          import os, sys
+          from datetime import datetime
+          print(f"[{datetime.utcnow().isoformat()}Z] Starting generator")
+          print(f"ENV: ACCESS={'set' if os.getenv('EATR_ACCESS_KEY') else 'missing'}, GROUP={'set' if os.getenv('EATR_GROUP_KEY') else 'missing'}")
+          print(f"ENV: ENDPOINT={os.getenv('EATR_ENDPOINT_URL','(none)')}")
+          # call the real generator
+          import tools.generate_region_zip as gen
+          print(f"[{datetime.utcnow().isoformat()}Z] Writing ZIP to out/NYSAND_Member_Files.zip")
+          # The generator already parses --out when executed as a script; here we call its logic by re-running as a module:
+          os.system("python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip")
+          print(f"[{datetime.utcnow().isoformat()}Z] Listing out/")
+          os.system("ls -la out || true")
+          PY
+
+      - name: Fail if artifact is empty (with diagnostics)
+        run: |
+          if [ ! -s out/NYSAND_Member_Files.zip ]; then
+            echo "::group::Diagnostics"
+            ls -la out || true
+            du -h out/NYSAND_Member_Files.zip || true
+            echo "::endgroup::"
+            echo "::error::ZIP is empty or missing"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
