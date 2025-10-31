@@ -9,20 +9,37 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo (release)
+        uses: actions/checkout@v4
         with:
           ref: release
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Use your pinned requirements, but ensure openpyxl (Excel writer) present
           pip install -r requirements.txt
-          
+          python -c "import openpyxl" 2>/dev/null || pip install openpyxl
+
+      # ---- Guardrails / diagnostics ----
+      - name: Sanity check required files
+        run: |
+          echo "Repo root contents:"
+          ls -la
+          echo "Assets contents:"
+          ls -la assets || true
+          # region map is required (bundled fallback)
+          test -f assets/nysand_region_zips.xlsx || (echo "::error::Missing assets/nysand_region_zips.xlsx" && exit 1)
+          # create output dir
+          mkdir -p out
+
       - name: Echo endpoint (sanity)
         env:
           EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
@@ -34,23 +51,32 @@ jobs:
           p = urlparse(u)
           print(f"endpoint: scheme={p.scheme or '(none)'} host={p.netloc or '(none)'} path={p.path or '(none)'}")
           PY
-        
 
+      # ---- Run non-interactive generator ----
       - name: Run headless generator
         env:
           EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
           EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
-          # TEMP: hardcode HTTP to prove the job can pass
-          EATR_ENDPOINT_URL: http://reports.eatright.org/MemberServices/MemberService.asmx
+          # If your generator needs an endpoint, provide one; HTTP avoids TLS issues some ADA endpoints have
+          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
         run: |
+          set -e
           python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip
+          echo "Contents of out/:"
+          ls -la out
 
+      # ---- Hard stop if ZIP is empty or missing ----
+      - name: Fail if artifact is empty
+        run: |
+          test -s out/NYSAND_Member_Files.zip || (echo "::error::ZIP is empty or missing"; exit 1)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: NYSAND_Member_Files
           path: out/NYSAND_Member_Files.zip
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload SOAP diagnostic (if present)
         if: always()
