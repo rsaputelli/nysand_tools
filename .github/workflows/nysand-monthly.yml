@@ -40,28 +40,20 @@ jobs:
           # create output dir
           mkdir -p out
 
-      - name: Echo endpoint (sanity)
-        env:
-          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
-        run: |
-          python - << 'PY'
-          import os
-          from urllib.parse import urlparse
-          u = os.environ.get("EATR_ENDPOINT_URL","")
-          p = urlparse(u)
-          print(f"endpoint: scheme={p.scheme or '(none)'} host={p.netloc or '(none)'} path={p.path or '(none)'}")
-          PY
+    - name: Echo endpoint (sanity)
+      env:
+        EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+      run: |
+        echo "Endpoint is: ${EATR_ENDPOINT_URL}"
 
-      # ---- Run non-interactive generator ----
-      - name: Run headless generator
-        env:
-          EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
-          EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
-          # If your generator needs an endpoint, provide one; HTTP avoids TLS issues some ADA endpoints have
-          EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
-        run: |
-          set -e
-          python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip
+    - name: Run headless generator
+      env:
+        EATR_ACCESS_KEY: ${{ secrets.EATR_ACCESS_KEY }}
+        EATR_GROUP_KEY:  ${{ secrets.EATR_GROUP_KEY }}
+        EATR_ENDPOINT_URL: ${{ secrets.EATR_ENDPOINT_URL }}
+      run: |
+        python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip
+
           echo "Contents of out/:"
           ls -la out
 

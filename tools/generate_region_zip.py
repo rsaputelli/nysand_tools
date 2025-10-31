@@ -1,29 +1,39 @@
-# tools/generate_region_zip.py
 import os, sys, re, zipfile, tempfile, base64, json
 from datetime import datetime
 import pandas as pd
 import requests
 import xmltodict
+import argparse  # already imported, safe duplicate
 
 # ---------- Config / Inputs ----------
-OUT_PATH = None
-for i, a in enumerate(sys.argv):
-    if a == "--out" and i + 1 < len(sys.argv):
-        OUT_PATH = sys.argv[i + 1]
-if not OUT_PATH:
-    print("Usage: python tools/generate_region_zip.py --out out/NYSAND_Member_Files.zip", file=sys.stderr)
-    sys.exit(2)
+
+# 🟢 BEGIN INSERT: Explicit CLI + env handling
+def _endpoint() -> str:
+    """Resolve endpoint with environment or fallback to default WCF service."""
+    return os.getenv("EATR_ENDPOINT_URL", "http://ws.eatright.org/service/service.svc").strip()
+
+def _args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="output ZIP path")
+    return ap.parse_args()
+
+ARGS = _args()
+OUT_PATH = ARGS.out
+# 🟢 END INSERT
 
 ACCESS_KEY   = os.getenv("EATR_ACCESS_KEY", "").strip()
 GROUP_KEY    = os.getenv("EATR_GROUP_KEY", "").strip()
-ENDPOINT     = os.getenv("EATR_ENDPOINT_URL", "http://ws.eatright.org/service/service.svc").strip()
+ENDPOINT     = _endpoint()
 WSDL_URL     = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
 REGION_XLSX  = os.getenv("REGION_ZIPS_PATH", "assets/nysand_region_zips.xlsx")
-CSV_FALLBACK = os.getenv("API_CSV_FALLBACK", "assets/api_seed.csv")  # file path (optional)
-CSV_B64_ENV  = os.getenv("API_CSV_BASE64", "")  # base64 of CSV (optional)
+CSV_FALLBACK = os.getenv("API_CSV_FALLBACK", "assets/api_seed.csv")
+CSV_B64_ENV  = os.getenv("API_CSV_BASE64", "")
 
 SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 API_NS  = "http://eatright/membership"
+
+# --- diagnostics ---
+print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint → {ENDPOINT}")
 
 def _wsdl_actions_map() -> dict:
     try:
