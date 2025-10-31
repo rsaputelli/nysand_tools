@@ -271,17 +271,18 @@ def _load_fallback_csv() -> pd.DataFrame:
 
 def run_build(out_path: str):
     """Main build: fetch members, load region map, zip outputs, write to out_path."""
+    global ENDPOINT, WSDL_URL
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     print(f"[{datetime.utcnow().isoformat()}Z] Fetching members…")
     if ENDPOINT.lower().startswith("http://"):
         print(f"[{datetime.utcnow().isoformat()}Z] Using endpoint scheme=http")
+
 
     # Try endpoint x method combos until one returns non-empty
     members = pd.DataFrame()
     errors = []
     for ep in _endpoint_candidates():
         # temporarily override ENDPOINT for this attempt
-        global ENDPOINT, WSDL_URL
         ENDPOINT = ep
         WSDL_URL = ENDPOINT + "?wsdl" if "?" not in ENDPOINT else ENDPOINT
         print(f"[{datetime.utcnow().isoformat()}Z] Trying endpoint: {ENDPOINT}")
