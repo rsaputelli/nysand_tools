@@ -77,13 +77,9 @@ def _soap_envelope(body_xml: str, access_key: str | None) -> str:
 def _post_soap(action: str, envelope_xml: str) -> dict:
     """Send SOAP request trying membership and org namespaces (WCF tolerant)."""
     candidates = [
-        f"http://eatright/membership/{action}",
-        f"http://eatright/membership/IService/{action}",
-        f"http://eatright/membership/IWcfAdaMembership/{action}",
-        f"http://eatright.org/membership/{action}",             # added
-        f"http://eatright.org/membership/IService/{action}",    # added
-        f"http://eatright.org/membership/IWcfAdaMembership/{action}",  # added
-        ""  # sometimes empty works
+        f"http://eatright.org/membership/IWcfAdaMembership/{action}",
+        f"http://eatright.org/membership/IService/{action}",
+        f"http://eatright.org/membership/{action}"
     ]
 
     last_body, errors = "", []
