@@ -1,4 +1,3 @@
-# NYSAND_Regional_List_creator.py  (drop-in repaired)
 import os
 import re
 import zipfile
@@ -9,10 +8,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import xmltodict
-
-import streamlit as st
-from datetime import datetime
-# (other imports...)
 
 # ---- persistence slots (added for download link persistence) ----
 st.session_state.setdefault("region_blob", None)
@@ -53,14 +48,16 @@ with header_left:
 with header_right:
     st.markdown("## NYSAND Region-Based Member Splitter")
 
-st.markdown("""
+st.markdown(
+    """
 Upload your **Member Export CSV** and the **NYSAND Region Zipcodes Excel file**, **or** fetch the member list via the EatRight SOAP API, then:
 - Clean and match ZIP codes  
 - Add Region and County  
 - Split the data by Region  
 - Provide an unmatched/out-of-state file  
 - Download everything in a single ZIP
-""")
+"""
+)
 
 
 # =========================
@@ -114,6 +111,7 @@ def _wsdl_action_for(method: str) -> list[str]:
 # =========================
 # Shared processing helpers
 # =========================
+
 def _clean_zip(z):
     """Extract first 5 digits, return as 5-char string (drops +4 and non-digits)."""
     if z is None or (isinstance(z, float) and pd.isna(z)):
@@ -386,6 +384,7 @@ def _debug_merge_preview(members_df: pd.DataFrame, region_sheets: dict):
 # =========================
 # Core processing
 # =========================
+
 def process_and_package(members: pd.DataFrame, region_sheets: dict) -> bytes:
     """Return a bytes ZIP containing per-region workbooks + unmatched workbook."""
     # --- Normalize member ZIPs from any known column name ---
@@ -514,9 +513,11 @@ if source == "Manual Upload":
 
             # --- Create outputs ---
             with st.spinner("Processing files..."):
-            # Persist ZIP so it stays after reruns
-            st.session_state["region_blob"] = blob
-            st.session_state["region_blob_ts"] = datetime.now().strftime("%Y-%m-%d")
+                blob = process_and_package(members_df, region_sheets)
+
+                # Persist ZIP so it stays after reruns
+                st.session_state["region_blob"] = blob
+                st.session_state["region_blob_ts"] = datetime.now().strftime("%Y-%m-%d")
 
             st.success("✅ Done! Download your ZIP below.")
             st.download_button(
@@ -526,6 +527,15 @@ if source == "Manual Upload":
                 key="dl_region_zip_manual"
             )
 
+            # Resume last ZIP if available
+            if st.session_state.get("region_blob"):
+                label_ts = st.session_state.get("region_blob_ts")
+                st.download_button(
+                    f"📦 Re-download last ZIP" + (f" (built {label_ts})" if label_ts else ""),
+                    st.session_state["region_blob"],
+                    file_name="NYSAND_Member_Files.zip",
+                    key="dl_region_zip_resume_manual"
+                )
 
 elif source == "EatRight SOAP API":
     st.info("Uses secrets: EATR_ACCESS_KEY and EATR_GROUP_KEY")
@@ -622,12 +632,27 @@ elif source == "EatRight SOAP API":
             with st.spinner("Creating region files…"):
                 blob = process_and_package(api_df, region_sheets)
             today = datetime.now().strftime("%Y-%m-%d")
+
+            # Persist for reruns
+            st.session_state["region_blob"] = blob
+            st.session_state["region_blob_ts"] = today
+
             st.success("✅ Done! Download your ZIP below.")
             st.download_button(
                 "📥 Download All Files (ZIP)",
                 blob,
                 file_name=f"NYSAND_Member_Files_{today}.zip",
+                key="dl_region_zip_api"
             )
+
+            # Resume last ZIP if available
+            if st.session_state.get("region_blob"):
+                st.download_button(
+                    f"📦 Re-download last ZIP (built {today})",
+                    st.session_state["region_blob"],
+                    file_name=f"NYSAND_Member_Files_{today}.zip",
+                    key="dl_region_zip_resume_api"
+                )
 
         except KeyError as e:
             st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
@@ -645,79 +670,14 @@ elif source == "EatRight SOAP API":
             except Exception:
                 pass
 
+# ===== Footer quick-help: show last ZIP if user reruns app without inputs =====
+with st.sidebar:
+    if st.session_state.get("region_blob"):
+        lbl = st.session_state.get("region_blob_ts") or ""
+        st.download_button(
+            f"📦 Re-download last ZIP" + (f" (built {lbl})" if lbl else ""),
+            st.session_state["region_blob"],
+            file_name="NYSAND_Member_Files.zip",
+            key="dl_region_zip_sidebar"
+        )
 
-            region_sheets = load_region_mapping(region_file)
-            if region_sheets is None:
-                st.error("Region mapping not found. Please add assets/nysand_region_zips.xlsx to the repo or upload it above.")
-                st.stop()
-
-            # --- DEBUG PANEL: inspect API data and merge behavior ---
-            with st.expander("🔎 Debug — Inspect API data and ZIP matching", expanded=True):
-                st.write("**API columns:**", list(api_df.columns))
-                st.dataframe(api_df.head(10))
-
-                merged_dbg, zip_map_dbg, src_zip = _debug_merge_preview(api_df, region_sheets)
-                matched_ct = merged_dbg["Region"].notna().sum()
-                total_ct = len(merged_dbg)
-                st.info(
-                    f"Matched **{matched_ct:,} / {total_ct:,}** members"
-                    + (f" using ZIP column **{src_zip}**" if src_zip else " (no ZIP column detected)")
-                )
-
-                # Downloads
-                st.download_button(
-                    "⬇️ Download RAW API (csv)",
-                    api_df.to_csv(index=False).encode("utf-8"),
-                    file_name="api_raw.csv",
-                )
-                members_with_zip = merged_dbg.drop(
-                    columns=[c for c in ["County", "Region", "Zip_y"] if c in merged_dbg.columns],
-                    errors="ignore",
-                )
-                st.download_button(
-                    "⬇️ Download Members + Zip_clean (csv)",
-                    members_with_zip.to_csv(index=False).encode("utf-8"),
-                    file_name="members_with_zip_clean.csv",
-                )
-                st.download_button(
-                    "⬇️ Download Region Map (standardized) (csv)",
-                    zip_map_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="region_map_standardized.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MERGED (full) (csv)",
-                    merged_dbg.to_csv(index=False).encode("utf-8"),
-                    file_name="merged_full.csv",
-                )
-                st.download_button(
-                    "⬇️ Download MATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].notna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_matched_only.csv",
-                )
-                st.download_button(
-                    "⬇️ Download UNMATCHED only (csv)",
-                    merged_dbg[merged_dbg["Region"].isna()].to_csv(index=False).encode("utf-8"),
-                    file_name="merged_unmatched_only.csv",
-                )
-
-            # --- Create outputs ---
-            with st.spinner("Creating region files…"):
-                blob = process_and_package(api_df, region_sheets)
-            today = datetime.now().strftime("%Y-%m-%d")
-            # Persist ZIP so it stays after reruns
-            st.session_state["region_blob"] = blob
-            st.session_state["region_blob_ts"] = today
-
-            st.success("✅ Done! Download your ZIP below.")
-            st.download_button(
-                "📥 Download All Files (ZIP)",
-                blob,
-                file_name=f"NYSAND_Member_Files_{today}.zip",
-                key="dl_region_zip_api"
-            )
-
-        except KeyError as e:
-            st.error(f"Missing secret: {e}. Please set EATR_ACCESS_KEY and EATR_GROUP_KEY.")
-        except Exception as e:
-            st.error(f"API fetch failed: {e}")
-            st.exception(e)
